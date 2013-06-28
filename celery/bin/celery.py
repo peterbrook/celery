@@ -52,7 +52,7 @@ command_classes = [
     ('Remote Control', ['status', 'inspect', 'control'], 'blue'),
     ('Utils', ['purge', 'list', 'migrate', 'call', 'result', 'report'], None),
 ]
-if DEBUG:
+if DEBUG:  # pragma: no cover
     command_classes.append(
         ('Debug', ['graph'], 'red'),
     )
@@ -89,7 +89,6 @@ class multi(Command):
 
     def run_from_argv(self, prog_name, argv, command=None):
         from celery.bin.multi import MultiTool
-        argv.append("--cmd=%s worker --detach" % prog_name)
         return MultiTool().execute_from_commandline(
             [command] + argv, prog_name,
         )
@@ -331,15 +330,6 @@ class _RemoteControl(Command):
                              status=EX_UNAVAILABLE)
         return replies
 
-    def say(self, direction, title, body=''):
-        c = self.colored
-        if direction == '<-' and self.quiet:
-            return
-        dirstr = not self.quiet and c.bold(c.white(direction), ' ') or ''
-        self.out(c.reset(dirstr, title))
-        if body and self.show_body:
-            self.out(body)
-
 
 class inspect(_RemoteControl):
     """Inspect the worker at runtime.
@@ -365,12 +355,18 @@ class inspect(_RemoteControl):
         'ping': (0.2, 'ping worker(s)'),
         'clock': (1.0, 'get value of logical clock'),
         'conf': (1.0, 'dump worker configuration'),
-        'report': (1.0, 'get bugreport info')
+        'report': (1.0, 'get bugreport info'),
+        'memsample': (1.0, 'sample memory (requires psutil)'),
+        'memdump': (1.0, 'dump memory samples (requires psutil)'),
+        'objgraph': (60.0, 'create object graph (requires objgraph)'),
     }
 
     def call(self, method, *args, **options):
         i = self.app.control.inspect(**options)
         return getattr(i, method)(*args)
+
+    def objgraph(self, type_='Request', *args, **kwargs):
+        return self.call('objgraph', type_)
 
 
 class control(_RemoteControl):
@@ -406,7 +402,7 @@ class control(_RemoteControl):
     }
 
     def call(self, method, *args, **options):
-        return getattr(self.app.control, method)(*args, retry=True, **options)
+        return getattr(self.app.control, method)(*args, reply=True, **options)
 
     def pool_grow(self, method, n=1, **kwargs):
         """[N=1]"""
@@ -709,8 +705,13 @@ class CeleryCommand(Command):
                 index += 1
         return []
 
+    def prepare_prog_name(self, name):
+        if name == '__main__.py':
+            return sys.modules['__main__'].__file__
+        return name
+
     def handle_argv(self, prog_name, argv):
-        self.prog_name = prog_name
+        self.prog_name = self.prepare_prog_name(prog_name)
         argv = self.remove_options_at_beginning(argv)
         _, argv = self.prepare_args(None, argv)
         try:
@@ -756,7 +757,7 @@ class CeleryCommand(Command):
         return '\n'.join(ret).strip()
 
     def with_pool_option(self, argv):
-        if len(argv) > 1 and argv[1] == 'worker':
+        if len(argv) > 1 and 'worker' in argv[0:3]:
             # this command supports custom pools
             # that may have to be loaded as early as possible.
             return (['-P'], ['--pool'])

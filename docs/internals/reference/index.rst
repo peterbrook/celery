@@ -8,18 +8,10 @@
 .. toctree::
     :maxdepth: 1
 
-    celery.worker
     celery.worker.components
-    celery.worker.consumer
     celery.worker.loops
-    celery.worker.job
-    celery.worker.mediator
-    celery.worker.buckets
     celery.worker.heartbeat
-    celery.worker.hub
     celery.worker.control
-    celery.worker.state
-    celery.worker.strategy
     celery.worker.pidbox
     celery.worker.autoreload
     celery.worker.autoscale
@@ -41,14 +33,13 @@
     celery.backends.redis
     celery.backends.cassandra
     celery.task.trace
-    celery.app.abstract
     celery.app.annotations
     celery.app.routes
+    celery.datastructures
     celery.security.certificate
     celery.security.key
     celery.security.serialization
     celery.security.utils
-    celery.datastructures
     celery.events.snapshot
     celery.events.cursesmon
     celery.events.dumper

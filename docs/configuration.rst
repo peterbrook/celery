@@ -66,11 +66,16 @@ CELERY_TIMEZONE
 ---------------
 
 Configure Celery to use a custom time zone.
-The timezone value can be any time zone supported by the :mod:`pytz`
+The timezone value can be any time zone supported by the `pytz`_
 library.
 
-If not set then the UTC timezone is used if :setting:`CELERY_ENABLE_UTC` is
-enabled, otherwise it falls back to the local timezone.
+If not set the UTC timezone is used.  For backwards compatibility
+there is also a :setting:`CELERY_ENABLE_UTC` setting, and this is set
+to false the system local timezone is used instead.
+
+.. _`pytz`: http://pypi.python.org/pypi/pytz/
+
+
 
 .. _conf-tasks:
 
@@ -159,6 +164,10 @@ have very long running tasks waiting in the queue and you have to start the
 workers, note that the first worker to start will receive four times the
 number of messages initially.  Thus the tasks may not be fairly distributed
 to the workers.
+
+.. note::
+
+    Tasks with ETA/countdown are not affected by prefetch limits.
 
 .. _conf-result-backend:
 
@@ -255,6 +264,12 @@ To use this backend you need to configure it with an
 See `Connection String`_ for more information about connection
 strings.
 
+.. _`Supported Databases`:
+    http://www.sqlalchemy.org/docs/core/engines.html#supported-databases
+
+.. _`Connection String`:
+    http://www.sqlalchemy.org/docs/core/engines.html#database-urls
+
 .. setting:: CELERY_RESULT_ENGINE_OPTIONS
 
 CELERY_RESULT_ENGINE_OPTIONS
@@ -277,11 +292,22 @@ going stale through inactivity.  For example, intermittent errors like
 `(OperationalError) (2006, 'MySQL server has gone away')` can be fixed by enabling
 short lived sessions.  This option only affects the database backend.
 
-.. _`Supported Databases`:
-    http://www.sqlalchemy.org/docs/core/engines.html#supported-databases
+Specifying Table Names
+~~~~~~~~~~~~~~~~~~~~~~
 
-.. _`Connection String`:
-    http://www.sqlalchemy.org/docs/core/engines.html#database-urls
+.. setting:: CELERY_RESULT_DB_TABLENAMES
+
+When SQLAlchemy is configured as the result backend, Celery automatically
+creates two tables to store result metadata for tasks.  This setting allows
+you to customize the table names:
+
+.. code-block:: python
+
+    # use custom table names for the database result backend.
+    CELERY_RESULT_DB_TABLENAMES = {
+        'task': 'myapp_taskmeta',
+        'group': 'myapp_groupmeta',
+    }
 
 Example configuration
 ~~~~~~~~~~~~~~~~~~~~~
@@ -290,6 +316,8 @@ Example configuration
 
     CELERY_RESULT_BACKEND = "database"
     CELERY_RESULT_DBURI = "mysql://user:password@host/dbname"
+    CELERY_RESULT_DB_TASK_TABLENAME = "myapp_taskmeta"
+    CELERY_RESULT_DB_TASKSET_TABLENAME = "myapp_tasksetmeta"
 
 .. _conf-amqp-result-backend:
 
@@ -605,7 +633,7 @@ IronCache backend settings
 
 .. note::
 
-    The Cassandra backend requires the :mod:`iron_celery` library:
+    The IronCache backend requires the :mod:`iron_celery` library:
     http://pypi.python.org/pypi/iron_celery
 
     To install the iron_celery package use `pip` or `easy_install`:
@@ -696,14 +724,11 @@ becomes::
     w1.example.com.dq
 
 Then you can route the task to the task by specifying the hostname
-as the routung key and the ``C.dq`` exchange::
+as the routing key and the ``C.dq`` exchange::
 
     CELERY_ROUTES = {
         'tasks.add': {'exchange': 'C.dq', 'routing_key': 'w1.example.com'}
     }
-
-This setting is mandatory if you want to use the ``move_to_worker`` features
-of :mod:`celery.contrib.migrate`.
 
 .. setting:: CELERY_CREATE_MISSING_QUEUES
 
@@ -1509,6 +1534,23 @@ Can be one of :const:`DEBUG`, :const:`INFO`, :const:`WARNING`,
 :const:`ERROR` or :const:`CRITICAL`.
 
 Default is :const:`WARNING`.
+
+.. setting:: CELERY_FORCE_BILLIARD_LOGGING
+
+CELERY_FORCE_BILLIARD_LOGGING
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 3.1
+
+Celery uses :mod:`multiprocessing`'s fork called `billiard` as a pool
+implementation. Python assumes we use :mod:`multiprocessing` when trying
+to log `processName` though. By default this option forces Celery to modify
+the logger class as early as possible in order to provide correct process
+name in log messages. If you are going to use :mod:`multiprocessing` along
+with Celery, you can disable this behavior by setting
+`CELERY_FORCE_BILLIARD_LOGGING = False`.
+
+Default is :const:`True`.
 
 .. _conf-security:
 

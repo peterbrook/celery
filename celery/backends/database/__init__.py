@@ -40,11 +40,11 @@ def retry(fun):
     def _inner(*args, **kwargs):
         max_retries = kwargs.pop('max_retries', 3)
 
-        for retries in range(max_retries + 1):
+        for retries in range(max_retries):
             try:
                 return fun(*args, **kwargs)
             except (DatabaseError, OperationalError):
-                if retries + 1 > max_retries:
+                if retries + 1 >= max_retries:
                     raise
 
     return _inner
@@ -69,6 +69,11 @@ class DatabaseBackend(BaseBackend):
             'short_lived_sessions',
             conf.CELERY_RESULT_DB_SHORT_LIVED_SESSIONS,
         )
+
+        tablenames = conf.CELERY_RESULT_DB_TABLENAMES or {}
+        Task.__table__.name = tablenames.get('task', 'celery_taskmeta')
+        TaskSet.__table__.name = tablenames.get('group', 'celery_tasksetmeta')
+
         if not self.dburi:
             raise ImproperlyConfigured(
                 'Missing connection string! Do you have '

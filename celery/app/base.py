@@ -20,6 +20,7 @@ from operator import attrgetter
 
 from billiard.util import register_after_fork
 from kombu.clocks import LamportClock
+from kombu.common import oid_from
 from kombu.serialization import enable_insecure_serializers
 from kombu.utils import cached_property
 
@@ -31,6 +32,7 @@ from celery.loaders import get_loader_cls
 from celery.local import PromiseProxy, maybe_evaluate
 from celery.utils.functional import first
 from celery.utils.imports import instantiate, symbol_by_name
+from celery.utils.log import ensure_process_aware_logger
 from celery.utils.objects import mro_lookup
 
 from .annotations import prepare as prepare_annotations
@@ -38,7 +40,7 @@ from .builtins import shared_task, load_shared_tasks
 from .defaults import DEFAULTS, find_deprecated_settings
 from .registry import TaskRegistry
 from .utils import (
-    AppPickler, Settings, bugreport, _unpickle_app, _unpickle_app_v2,
+    AppPickler, Settings, bugreport, _unpickle_app, _unpickle_app_v2, appstr,
 )
 
 _EXECV = os.environ.get('FORKED_BY_MULTIPROCESSING')
@@ -46,7 +48,7 @@ BUILTIN_FIXUPS = frozenset([
     'celery.fixups.django:fixup',
 ])
 
-ERROR_ENVVAR_NOT_SET = """\
+ERR_ENVVAR_NOT_SET = """\
 The environment variable {0!r} is not set,
 and as such the configuration could not be loaded.
 Please set this variable and make it point to
@@ -212,11 +214,12 @@ class Celery(object):
 
     def _task_from_fun(self, fun, **options):
         base = options.pop('base', None) or self.Task
+        bind = options.pop('bind', False)
 
         T = type(fun.__name__, (base, ), dict({
             'app': self,
             'accept_magic_kwargs': False,
-            'run': staticmethod(fun),
+            'run': fun if bind else staticmethod(fun),
             '__doc__': fun.__doc__,
             '__module__': fun.__module__}, **options))()
         task = self._tasks[T.name]  # return global instance.
@@ -253,13 +256,19 @@ class Celery(object):
         if not module_name:
             if silent:
                 return False
-            raise ImproperlyConfigured(ERROR_ENVVAR_NOT_SET % module_name)
+            raise ImproperlyConfigured(ERR_ENVVAR_NOT_SET.format(module_name))
         return self.config_from_object(module_name, silent=silent)
 
     def config_from_cmdline(self, argv, namespace='celery'):
         self.conf.update(self.loader.cmdline_config_parser(argv, namespace))
 
     def autodiscover_tasks(self, packages, related_name='tasks'):
+        if self.conf.CELERY_FORCE_BILLIARD_LOGGING:
+            # we'll use billiard's processName instead of
+            # multiprocessing's one in all the loggers
+            # created after this call
+            ensure_process_aware_logger()
+
         self.loader.autodiscover_tasks(packages, related_name)
 
     def send_task(self, name, args=None, kwargs=None, countdown=None,
@@ -449,8 +458,7 @@ class Celery(object):
         return attrgetter(path)(self)
 
     def __repr__(self):
-        return '<{0} {1}:0x{2:x}>'.format(
-            type(self).__name__, self.main or '__main__', id(self))
+        return '<{0} {1}>'.format(type(self).__name__, appstr(self))
 
     def __reduce__(self):
         if self._using_v1_reduce:
@@ -537,6 +545,10 @@ class Celery(object):
     @property
     def current_task(self):
         return _task_stack.top
+
+    @cached_property
+    def oid(self):
+        return oid_from(self)
 
     @cached_property
     def amqp(self):

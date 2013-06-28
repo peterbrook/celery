@@ -7,35 +7,17 @@ import warnings
 from mock import Mock, patch
 
 from celery import loaders
-from celery.app import app_or_default
 from celery.exceptions import (
     NotConfigured,
-    ImproperlyConfigured,
     CPendingDeprecationWarning,
 )
-from celery.five import items
 from celery.loaders import base
 from celery.loaders import default
 from celery.loaders.app import AppLoader
 from celery.utils.imports import NotAPackage
 from celery.utils.mail import SendmailWarning
 
-from celery.tests.utils import AppCase, Case
-
-
-class ObjectConfig(object):
-    FOO = 1
-    BAR = 2
-
-object_config = ObjectConfig()
-dict_config = dict(FOO=10, BAR=20)
-
-
-class Object(object):
-
-    def __init__(self, **kwargs):
-        for k, v in items(kwargs):
-            setattr(self, k, v)
+from celery.tests.case import AppCase, Case
 
 
 class DummyLoader(base.BaseLoader):
@@ -64,7 +46,7 @@ class test_loaders(AppCase):
             self.assertIs(loaders.load_settings(), self.app.conf)
 
 
-class test_LoaderBase(Case):
+class test_LoaderBase(AppCase):
     message_options = {'subject': 'Subject',
                        'body': 'Body',
                        'sender': 'x@x.com',
@@ -75,13 +57,30 @@ class test_LoaderBase(Case):
                       'password': 'qwerty',
                       'timeout': 3}
 
-    def setUp(self):
-        self.loader = DummyLoader()
-        self.app = app_or_default()
+    def setup(self):
+        self.loader = DummyLoader(app=self.app)
 
     def test_handlers_pass(self):
         self.loader.on_task_init('foo.task', 'feedface-cafebabe')
         self.loader.on_worker_init()
+
+    def test_now(self):
+        self.assertTrue(self.loader.now(utc=True))
+        self.assertTrue(self.loader.now(utc=False))
+
+    def test_read_configuration_no_env(self):
+        self.assertDictEqual(
+            base.BaseLoader().read_configuration('FOO_X_S_WE_WQ_Q_WE'),
+            {},
+        )
+
+    def test_autodiscovery(self):
+        with patch('celery.loaders.base.autodiscover_tasks') as auto:
+            auto.return_value = [Mock()]
+            auto.return_value[0].__name__ = 'moo'
+            self.loader.autodiscover_tasks(['A', 'B'])
+            self.assertIn('moo', self.loader.task_modules)
+            self.loader.task_modules.discard('moo')
 
     def test_import_task_module(self):
         self.assertEqual(sys, self.loader.import_task_module('sys'))
@@ -183,6 +182,8 @@ class test_DefaultLoader(Case):
         l = default.Loader()
         with self.assertWarnsRegex(NotConfigured, r'make sure it exists'):
             l.read_configuration()
+        default.C_WNOCONF = False
+        l.read_configuration()
 
     def test_read_configuration(self):
         from types import ModuleType
@@ -239,31 +240,10 @@ class test_DefaultLoader(Case):
         self.assertTrue(context_executed[0])
 
 
-class test_AppLoader(Case):
+class test_AppLoader(AppCase):
 
-    def setUp(self):
-        self.app = app_or_default()
+    def setup(self):
         self.loader = AppLoader(app=self.app)
-
-    def test_config_from_envvar(self, key='CELERY_HARNESS_CFG1'):
-        self.assertFalse(self.loader.config_from_envvar('HDSAJIHWIQHEWQU',
-                                                        silent=True))
-        with self.assertRaises(ImproperlyConfigured):
-            self.loader.config_from_envvar('HDSAJIHWIQHEWQU', silent=False)
-        os.environ[key] = __name__ + '.object_config'
-        self.assertTrue(self.loader.config_from_envvar(key))
-        self.assertEqual(self.loader.conf['FOO'], 1)
-        self.assertEqual(self.loader.conf['BAR'], 2)
-
-        os.environ[key] = 'unknown_asdwqe.asdwqewqe'
-        with self.assertRaises(ImportError):
-            self.loader.config_from_envvar(key, silent=False)
-        self.assertFalse(self.loader.config_from_envvar(key, silent=True))
-
-        os.environ[key] = __name__ + '.dict_config'
-        self.assertTrue(self.loader.config_from_envvar(key))
-        self.assertEqual(self.loader.conf['FOO'], 10)
-        self.assertEqual(self.loader.conf['BAR'], 20)
 
     def test_on_worker_init(self):
         prev, self.app.conf.CELERY_IMPORTS = (
@@ -274,3 +254,30 @@ class test_AppLoader(Case):
             self.assertIn('subprocess', sys.modules)
         finally:
             self.app.conf.CELERY_IMPORTS = prev
+
+
+class test_autodiscovery(Case):
+
+    def test_autodiscover_tasks(self):
+        base._RACE_PROTECTION = True
+        try:
+            base.autodiscover_tasks(['foo'])
+        finally:
+            base._RACE_PROTECTION = False
+        with patch('celery.loaders.base.find_related_module') as frm:
+            base.autodiscover_tasks(['foo'])
+            self.assertTrue(frm.called)
+
+    def test_find_related_module(self):
+        with patch('importlib.import_module') as imp:
+            with patch('imp.find_module') as find:
+                imp.return_value = Mock()
+                imp.return_value.__path__ = 'foo'
+                base.find_related_module(base, 'tasks')
+
+                imp.side_effect = AttributeError()
+                base.find_related_module(base, 'tasks')
+                imp.side_effect = None
+
+                find.side_effect = ImportError()
+                base.find_related_module(base, 'tasks')

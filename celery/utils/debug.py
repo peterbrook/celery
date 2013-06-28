@@ -6,13 +6,14 @@
     Utilities for debugging memory usage.
 
 """
-from __future__ import absolute_import
+from __future__ import absolute_import, print_function
 
 import os
 
 from contextlib import contextmanager
+from functools import partial
 
-from celery.five import format_d, range
+from celery.five import range
 from celery.platforms import signals
 
 try:
@@ -55,10 +56,22 @@ def sample_mem():
     Statistics can then be output by calling :func:`memdump`.
 
     """
-    _mem_sample.append(mem_rss())
+    current_rss = mem_rss()
+    _mem_sample.append(current_rss)
+    return current_rss
 
 
-def memdump(samples=10):
+def _memdump(samples=10):
+    S = _mem_sample
+    prev = list(S) if len(S) <= samples else sample(S, samples)
+    _mem_sample[:] = []
+    import gc
+    gc.collect()
+    after_collect = mem_rss()
+    return prev, after_collect
+
+
+def memdump(samples=10, file=None):
     """Dump memory statistics.
 
     Will print a sample of all RSS memory samples added by
@@ -66,17 +79,16 @@ def memdump(samples=10):
     used RSS memory after :func:`gc.collect`.
 
     """
+    say = partial(print, file=file)
     if ps() is None:
-        print('- rss: (psutil not installed).')
+        say('- rss: (psutil not installed).')
         return
-    if any(_mem_sample):
-        print('- rss (sample):')
-        for mem in sample(_mem_sample, samples):
-            print('-    > {0},'.format(mem))
-        _mem_sample[:] = []
-    import gc
-    gc.collect()
-    print('- rss (end): {0}.'.format(mem_rss()))
+    prev, after_collect = _memdump(samples)
+    if prev:
+        say('- rss (sample):')
+        for mem in prev:
+            say('-    > {0},'.format(mem))
+    say('- rss (end): {0}.'.format(after_collect))
 
 
 def sample(x, n, k=0):
@@ -94,11 +106,32 @@ def sample(x, n, k=0):
         k += j
 
 
+UNITS = (
+    (2 ** 40.0, 'TB'),
+    (2 ** 30.0, 'GB'),
+    (2 ** 20.0, 'MB'),
+    (2 ** 10.0, 'kB'),
+    (0.0, '{0!d}b'),
+)
+
+
+def hfloat(f, p=5):
+    i = int(f)
+    return i if i == f else '{0:.{p}}'.format(f, p=p)
+
+
+def humanbytes(s):
+    return next(
+        '{0}{1}'.format(hfloat(s / div if div else s), unit)
+        for div, unit in UNITS if s >= div
+    )
+
+
 def mem_rss():
     """Returns RSS memory usage as a humanized string."""
     p = ps()
     if p is not None:
-        return '{0}MB'.format(format_d(p.get_memory_info().rss // 1024))
+        return humanbytes(p.get_memory_info().rss)
 
 
 def ps():

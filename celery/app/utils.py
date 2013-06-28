@@ -12,9 +12,9 @@ import os
 import platform as _platform
 import re
 
-from celery.platforms import pyimplementation
-from celery.five import items
 from celery.datastructures import ConfigurationView
+from celery.five import items
+from celery.platforms import pyimplementation
 from celery.utils.text import pretty
 from celery.utils.imports import qualname
 
@@ -35,6 +35,11 @@ HIDDEN_SETTINGS = re.compile(
     'API|TOKEN|KEY|SECRET|PASS|PROFANITIES_LIST|SIGNATURE|DATABASE',
     re.IGNORECASE,
 )
+
+
+def appstr(app):
+    """String used in __repr__ etc, to id app instances."""
+    return '{0}:0x{1:x}'.format(app.main or '__main__', id(app))
 
 
 class Settings(ConfigurationView):

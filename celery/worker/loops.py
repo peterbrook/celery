@@ -15,60 +15,53 @@ from types import GeneratorType as generator
 from kombu.utils.eventio import READ, WRITE, ERR
 
 from celery.bootsteps import CLOSE
-from celery.exceptions import InvalidTaskError, SystemTerminate
+from celery.exceptions import SystemTerminate
 from celery.five import Empty
+from celery.utils.log import get_logger
 
 from . import state
 
+logger = get_logger(__name__)
+error = logger.error
 
-def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
-             heartbeat, handle_unknown_message, handle_unknown_task,
-             handle_invalid_task, clock, hbrate=2.0,
+
+def asynloop(obj, connection, consumer, blueprint, hub, qos,
+             heartbeat, clock, hbrate=2.0,
              sleep=sleep, min=min, Empty=Empty):
     """Non-blocking eventloop consuming messages until connection is lost,
     or shutdown is requested."""
 
-    with hub as hub:
-        update_qos = qos.update
-        update_readers = hub.update_readers
-        readers, writers = hub.readers, hub.writers
-        poll = hub.poller.poll
-        fire_timers = hub.fire_timers
-        scheduled = hub.timer._queue
-        hbtick = connection.heartbeat_check
-        conn_poll_start = connection.transport.on_poll_start
-        conn_poll_empty = connection.transport.on_poll_empty
-        pool_poll_start = obj.pool.on_poll_start
-        drain_nowait = connection.drain_nowait
-        on_task_callbacks = hub.on_task
-        keep_draining = connection.transport.nb_keep_draining
-        errors = connection.connection_errors
-        hub_add, hub_remove = hub.add, hub.remove
+    hub.init()
+    update_qos = qos.update
+    update_readers = hub.update_readers
+    readers, writers = hub.readers, hub.writers
+    poll = hub.poller.poll
+    fire_timers = hub.fire_timers
+    hub_add = hub.add
+    hub_remove = hub.remove
+    scheduled = hub.timer._queue
+    hbtick = connection.heartbeat_check
+    conn_poll_start = connection.transport.on_poll_start
+    conn_poll_empty = connection.transport.on_poll_empty
+    pool_poll_start = obj.pool.on_poll_start
+    drain_nowait = connection.drain_nowait
+    on_task_callbacks = hub.on_task
+    keep_draining = connection.transport.nb_keep_draining
+    errors = connection.connection_errors
+    hub_add, hub_remove = hub.add, hub.remove
 
-        if heartbeat and connection.supports_heartbeats:
-            hub.timer.apply_interval(
-                heartbeat * 1000.0 / hbrate, hbtick, (hbrate, ))
+    on_task_received = obj.create_task_handler(on_task_callbacks)
 
-        def on_task_received(body, message):
-            if on_task_callbacks:
-                [callback() for callback in on_task_callbacks]
-            try:
-                name = body['task']
-            except (KeyError, TypeError):
-                return handle_unknown_message(body, message)
+    if heartbeat and connection.supports_heartbeats:
+        hub.timer.apply_interval(
+            heartbeat * 1000.0 / hbrate, hbtick, (hbrate, ))
 
-            try:
-                strategies[name](message, body, message.ack_log_error)
-            except KeyError as exc:
-                handle_unknown_task(body, message, exc)
-            except InvalidTaskError as exc:
-                handle_invalid_task(body, message, exc)
+    consumer.callbacks = [on_task_received]
+    consumer.consume()
+    obj.on_ready()
 
-        consumer.callbacks = [on_task_received]
-        consumer.consume()
-        obj.on_ready()
-
-        while ns.state != CLOSE and obj.connection:
+    try:
+        while blueprint.state != CLOSE and obj.connection:
             # shutdown if signal handlers told us to.
             if state.should_stop:
                 raise SystemExit()
@@ -85,6 +78,8 @@ def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
             if qos.prev != qos.value:
                 update_qos()
 
+            #print('[[[HUB]]]: %s' % (hub.repr_active(), ))
+
             update_readers(conn_poll_start())
             pool_poll_start(hub)
             if readers or writers:
@@ -92,12 +87,14 @@ def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
                 while connection.more_to_read:
                     try:
                         events = poll(poll_timeout)
-                        #print('EVENTS: %r' % (hub.repr_events(events), ))
+                        #print('[[[EV]]]: %s' % (hub.repr_events(events), ))
                     except ValueError:  # Issue 882
                         return
+
                     if not events:
                         conn_poll_empty()
                     for fileno, event in events or ():
+                        cb = None
                         try:
                             if event & READ:
                                 cb = readers[fileno]
@@ -106,16 +103,26 @@ def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
                             elif event & ERR:
                                 cb = (readers.get(fileno) or
                                       writers.get(fileno))
-                                if cb is None:
-                                    continue
-                            if isinstance(cb, generator):
-                                cb.send((fileno, event))
-                            else:
-                                cb(fileno, event)
                         except (KeyError, Empty):
                             continue
+                        if cb is None:
+                            continue
+                        try:
+                            if isinstance(cb, generator):
+                                try:
+                                    next(cb)
+                                except StopIteration:
+                                    hub_remove(fileno)
+                                except Exception:
+                                    hub_remove(fileno)
+                                    raise
+                            else:
+                                try:
+                                    cb(fileno, event)
+                                except Empty:
+                                    continue
                         except socket.error:
-                            if ns.state != CLOSE:  # pragma: no cover
+                            if blueprint.state != CLOSE:  # pragma: no cover
                                 raise
                     if keep_draining:
                         drain_nowait()
@@ -125,39 +132,33 @@ def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
             else:
                 # no sockets yet, startup is probably not done.
                 sleep(min(poll_timeout, 0.1))
+    finally:
+        try:
+            hub.close()
+        except Exception as exc:
+            error(
+                'Error cleaning up after eventloop: %r', exc, exc_info=1,
+            )
 
 
-def synloop(obj, connection, consumer, strategies, ns, hub, qos,
-            heartbeat, handle_unknown_message, handle_unknown_task,
-            handle_invalid_task, clock, hbrate=2.0, **kwargs):
+def synloop(obj, connection, consumer, blueprint, hub, qos,
+            heartbeat, clock, hbrate=2.0, **kwargs):
     """Fallback blocking eventloop for transports that doesn't support AIO."""
 
-    def on_task_received(body, message):
-        try:
-            name = body['task']
-        except (KeyError, TypeError):
-            return handle_unknown_message(body, message)
-
-        try:
-            strategies[name](message, body, message.ack_log_error)
-        except KeyError as exc:
-            handle_unknown_task(body, message, exc)
-        except InvalidTaskError as exc:
-            handle_invalid_task(body, message, exc)
-
+    on_task_received = obj.create_task_handler([])
     consumer.register_callback(on_task_received)
     consumer.consume()
 
     obj.on_ready()
 
-    while ns.state != CLOSE and obj.connection:
+    while blueprint.state != CLOSE and obj.connection:
         state.maybe_shutdown()
-        if qos.prev != qos.value:         # pragma: no cover
+        if qos.prev != qos.value:
             qos.update()
         try:
             connection.drain_events(timeout=2.0)
         except socket.timeout:
             pass
         except socket.error:
-            if ns.state != CLOSE:  # pragma: no cover
+            if blueprint.state != CLOSE:
                 raise

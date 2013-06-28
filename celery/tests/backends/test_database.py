@@ -11,7 +11,7 @@ from celery.exceptions import ImproperlyConfigured
 from celery.result import AsyncResult
 from celery.utils import uuid
 
-from celery.tests.utils import (
+from celery.tests.case import (
     Case,
     mask_modules,
     skip_if_pypy,
@@ -21,9 +21,9 @@ from celery.tests.utils import (
 try:
     import sqlalchemy  # noqa
 except ImportError:
-    DatabaseBackend = Task = TaskSet = None  # noqa
+    DatabaseBackend = Task = TaskSet = retry = None  # noqa
 else:
-    from celery.backends.database import DatabaseBackend
+    from celery.backends.database import DatabaseBackend, retry
     from celery.backends.database.models import Task, TaskSet
 
 
@@ -40,6 +40,20 @@ class test_DatabaseBackend(Case):
     def setUp(self):
         if DatabaseBackend is None:
             raise SkipTest('sqlalchemy not installed')
+
+    def test_retry_helper(self):
+        from celery.backends.database import OperationalError
+
+        calls = [0]
+
+        @retry
+        def raises():
+            calls[0] += 1
+            raise OperationalError(1, 2, 3)
+
+        with self.assertRaises(OperationalError):
+            raises(max_retries=5)
+        self.assertEqual(calls[0], 5)
 
     def test_missing_SQLAlchemy_raises_ImproperlyConfigured(self):
         with mask_modules('sqlalchemy'):

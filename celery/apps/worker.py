@@ -24,7 +24,6 @@ from billiard import current_process
 from kombu.utils.encoding import safe_str
 
 from celery import VERSION_BANNER, platforms, signals
-from celery.app.abstract import from_config
 from celery.exceptions import SystemTerminate
 from celery.five import string, string_t
 from celery.loaders.app import AppLoader
@@ -86,19 +85,26 @@ EXTRA_INFO_FMT = """
 
 
 class Worker(WorkController):
-    redirect_stdouts = from_config()
-    redirect_stdouts_level = from_config()
 
-    def on_before_init(self, purge=False, no_color=None, **kwargs):
-        # apply task execution optimizations
+    def on_before_init(self, **kwargs):
         trace.setup_worker_optimizations(self.app)
 
         # this signal can be used to set up configuration for
         # workers by name.
-        conf = self.app.conf
         signals.celeryd_init.send(
-            sender=self.hostname, instance=self, conf=conf,
+            sender=self.hostname, instance=self, conf=self.app.conf,
         )
+
+    def on_after_init(self, purge=False, no_color=None,
+                      redirect_stdouts=None, redirect_stdouts_level=None,
+                      **kwargs):
+        self.redirect_stdouts = self._getopt(
+            'redirect_stdouts', redirect_stdouts,
+        )
+        self.redirect_stdouts_level = self._getopt(
+            'redirect_stdouts_level', redirect_stdouts_level,
+        )
+        super(Worker, self).setup_defaults(**kwargs)
         self.purge = purge
         self.no_color = no_color
         self._isatty = isatty(sys.stdout)
@@ -107,9 +113,10 @@ class Worker(WorkController):
             enabled=not no_color if no_color is not None else no_color
         )
 
-    def on_init_namespace(self):
+    def on_init_blueprint(self):
         self._custom_logging = self.setup_logging()
         # apply task execution optimizations
+        # -- This will finalize the app!
         trace.setup_worker_optimizations(self.app)
 
     def on_start(self):
@@ -196,7 +203,7 @@ class Worker(WorkController):
             version=VERSION_BANNER,
             conninfo=self.app.connection().as_uri(),
             concurrency=concurrency,
-            platform=_platform.platform(),
+            platform=safe_str(_platform.platform()),
             events=events,
             queues=app.amqp.queues.format(indent=0, indent_first=False),
         ).splitlines()
@@ -246,7 +253,7 @@ class Worker(WorkController):
 def _shutdown_handler(worker, sig='TERM', how='Warm',
                       exc=SystemExit, callback=None):
 
-    def _handle_request(signum, frame):
+    def _handle_request(*args):
         with in_sighandler():
             from celery.worker import state
             if current_process()._name == 'MainProcess':
@@ -263,11 +270,11 @@ def _shutdown_handler(worker, sig='TERM', how='Warm',
 install_worker_term_handler = partial(
     _shutdown_handler, sig='SIGTERM', how='Warm', exc=SystemExit,
 )
-if not is_jython:
+if not is_jython:  # pragma: no cover
     install_worker_term_hard_handler = partial(
         _shutdown_handler, sig='SIGQUIT', how='Cold', exc=SystemTerminate,
     )
-else:
+else:  # pragma: no cover
     install_worker_term_handler = \
         install_worker_term_hard_handler = lambda *a, **kw: None
 
@@ -275,11 +282,11 @@ else:
 def on_SIGINT(worker):
     safe_say('worker: Hitting Ctrl+C again will terminate all running tasks!')
     install_worker_term_hard_handler(worker, sig='SIGINT')
-if not is_jython:
+if not is_jython:  # pragma: no cover
     install_worker_int_handler = partial(
         _shutdown_handler, sig='SIGINT', callback=on_SIGINT
     )
-else:
+else:  # pragma: no cover
     install_worker_int_handler = lambda *a, **kw: None
 
 
@@ -322,9 +329,10 @@ def install_rdb_handler(envvar='CELERY_RDBSIG',
     def rdb_handler(*args):
         """Signal handler setting a rdb breakpoint at the current frame."""
         with in_sighandler():
-            _, frame = args
-            from celery.contrib import rdb
-            rdb.set_trace(frame)
+            from celery.contrib.rdb import set_trace, _frame
+            # gevent does not pass standard signal handler args
+            frame = args[1] if args else _frame().f_back
+            set_trace(frame)
     if os.environ.get(envvar):
         platforms.signals[sig] = rdb_handler
 

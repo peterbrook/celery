@@ -21,7 +21,6 @@ from kombu.utils import cached_property
 from kombu.utils.encoding import safe_str
 
 from celery.datastructures import DictAttribute
-from celery.exceptions import ImproperlyConfigured
 from celery.five import reraise, string_t
 from celery.utils.functional import maybe_list
 from celery.utils.imports import (
@@ -222,9 +221,9 @@ class BaseLoader(object):
                                   use_tls=use_tls)
         mailer.send(message, fail_silently=fail_silently)
 
-    def read_configuration(self):
+    def read_configuration(self, env='CELERY_CONFIG_MODULE'):
         try:
-            custom_config = os.environ['CELERY_CONFIG_MODULE']
+            custom_config = os.environ[env]
         except KeyError:
             pass
         else:

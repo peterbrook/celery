@@ -19,6 +19,7 @@ from itertools import chain as _chain
 from kombu.utils import cached_property, fxrange, kwdict, reprcall, uuid
 
 from celery._state import current_app
+from celery.exceptions import NotRegistered
 from celery.result import AsyncResult, GroupResult
 from celery.utils.functional import (
     maybe_list, is_list, regen,
@@ -163,13 +164,16 @@ class Signature(dict):
         return s
     partial = clone
 
-    def _freeze(self, _id=None):
+    def freeze(self, _id=None):
         opts = self.options
         try:
             tid = opts['task_id']
         except KeyError:
             tid = opts['task_id'] = _id or uuid()
+        if 'reply_to' not in opts:
+            opts['reply_to'] = self.type.app.oid
         return self.AsyncResult(tid)
+    _freeze = freeze
 
     def replace(self, args=None, kwargs=None, options=None):
         s = self.clone()
@@ -303,7 +307,10 @@ class chain(Signature):
 
     @property
     def type(self):
-        return self._type or self.tasks[0].type.app.tasks['celery.chain']
+        try:
+            return self._type or self.tasks[0].type.app.tasks['celery.chain']
+        except NotRegistered:
+            return current_app.tasks['celery.chain']
 
     def __repr__(self):
         return ' | '.join(repr(t) for t in self.tasks)
@@ -328,8 +335,8 @@ class _basemap(Signature):
         )
 
     @classmethod
-    def from_dict(self, d):
-        return chunks(*self._unpack_args(d['kwargs']), **d['options'])
+    def from_dict(cls, d):
+        return cls(*cls._unpack_args(d['kwargs']), **d['options'])
 
 
 class xmap(_basemap):
@@ -423,7 +430,7 @@ class group(Signature):
         type = tasks[0].type.app.tasks[self['task']]
         return type(*type.prepare(options, tasks, partial_args))
 
-    def _freeze(self, _id=None):
+    def freeze(self, _id=None):
         opts = self.options
         try:
             gid = opts['group']
@@ -436,6 +443,7 @@ class group(Signature):
             new_tasks.append(task)
         self.tasks = self.kwargs['tasks'] = new_tasks
         return GroupResult(gid, results)
+    _freeze = freeze
 
     def skew(self, start=1.0, stop=None, step=1.0):
         it = fxrange(start, stop, step, repeatlast=True)
@@ -477,14 +485,16 @@ class chord(Signature):
     def type(self):
         return self._type or self.tasks[0].type.app.tasks['celery.chord']
 
-    def __call__(self, body=None, **kwargs):
+    def __call__(self, body=None, task_id=None, **kwargs):
         _chord = self.type
         body = (body or self.kwargs['body']).clone()
         kwargs = dict(self.kwargs, body=body, **kwargs)
         if _chord.app.conf.CELERY_ALWAYS_EAGER:
             return self.apply((), kwargs)
-        callback_id = body.options.setdefault('task_id', uuid())
-        return _chord.AsyncResult(callback_id, parent=_chord(**kwargs))
+        res = body.freeze(task_id)
+        parent = _chord(**kwargs)
+        res.parent = parent
+        return res
 
     def clone(self, *args, **kwargs):
         s = Signature.clone(self, *args, **kwargs)

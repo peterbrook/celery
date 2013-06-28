@@ -20,7 +20,7 @@ from __future__ import absolute_import
 
 import threading
 
-from heapq import heappush
+from heapq import heappush, heappop
 from itertools import islice
 from operator import itemgetter
 from time import time
@@ -28,8 +28,9 @@ from time import time
 from kombu.utils import kwdict
 
 from celery import states
-from celery.datastructures import AttributeDict, LRUCache
+from celery.datastructures import AttributeDict
 from celery.five import items, values
+from celery.utils.functional import LRUCache
 from celery.utils.log import get_logger
 
 # The window (in percentage) is added to the workers heartbeat
@@ -49,6 +50,11 @@ Substantial drift from %s may mean clocks are out of sync.  Current drift is
 logger = get_logger(__name__)
 warn = logger.warning
 
+R_STATE = '<State: events={0.event_count} tasks={0.task_count}>'
+R_CLOCK = '_lamport(clock={0}, timestamp={1}, id={2} {3!r})'
+R_WORKER = '<Worker: {0.hostname} ({0.status_string})'
+R_TASK = '<Task: {0.name}({0.uuid}) {0.state}>'
+
 
 def heartbeat_expires(timestamp, freq=60,
                       expire_window=HEARTBEAT_EXPIRE_WINDOW):
@@ -62,7 +68,7 @@ class _lamportinfo(tuple):
         return tuple.__new__(cls, (clock, timestamp, id, obj))
 
     def __repr__(self):
-        return '_lamport(clock={0}, timestamp={1}, id={2} {3!r}'.format(*self)
+        return R_CLOCK.format(*self)
 
     def __getnewargs__(self):
         return tuple(self)
@@ -74,7 +80,7 @@ class _lamportinfo(tuple):
             # uses logical clock value first
             if A and B:  # use logical clock if available
                 if A == B:  # equal clocks use lower process id
-                    return self[3] < other[3]
+                    return self[2] < other[2]
                 return A < B
             return self[1] < other[1]  # ... or use timestamp
         except IndexError:
@@ -89,19 +95,38 @@ class _lamportinfo(tuple):
     obj = property(itemgetter(3))
 
 
-class Element(AttributeDict):
-    """Base class for worker state elements."""
+def with_unique_field(attr):
+
+    def _decorate_cls(cls):
+
+        def __eq__(this, other):
+            if isinstance(other, this.__class__):
+                return getattr(this, attr) == getattr(other, attr)
+            return NotImplemented
+        cls.__eq__ = __eq__
+
+        def __ne__(this, other):
+            return not this.__eq__(other)
+        cls.__ne__ = __ne__
+
+        def __hash__(this):
+            return hash(getattr(this, attr))
+        cls.__hash__ = __hash__
+
+        return cls
+    return _decorate_cls
 
 
-class Worker(Element):
+@with_unique_field('hostname')
+class Worker(AttributeDict):
     """Worker State."""
     heartbeat_max = 4
     expire_window = HEARTBEAT_EXPIRE_WINDOW
     pid = None
+    _defaults = {'hostname': None, 'pid': None, 'freq': 60}
 
     def __init__(self, **fields):
-        fields.setdefault('freq', 60)
-        super(Worker, self).__init__(**fields)
+        dict.__init__(self, self._defaults, **fields)
         self.heartbeats = []
 
     def on_online(self, timestamp=None, local_received=None, **kwargs):
@@ -122,7 +147,7 @@ class Worker(Element):
     def update_heartbeat(self, received, timestamp):
         if not received or not timestamp:
             return
-        drift = received - timestamp
+        drift = abs(received - timestamp)
         if drift > HEARTBEAT_DRIFT_MAX:
             warn(DRIFT_WARNING, self.hostname, drift)
         heartbeats, hbmax = self.heartbeats, self.heartbeat_max
@@ -132,7 +157,7 @@ class Worker(Element):
                 heartbeats[:] = heartbeats[hbmax:]
 
     def __repr__(self):
-        return '<Worker: {0.hostname} ({0.status_string})'.format(self)
+        return R_WORKER.format(self)
 
     @property
     def status_string(self):
@@ -152,7 +177,8 @@ class Worker(Element):
         return '{0.hostname}.{0.pid}'.format(self)
 
 
-class Task(Element):
+@with_unique_field('uuid')
+class Task(AttributeDict):
     """Task State."""
 
     #: How to merge out of order events.
@@ -182,7 +208,7 @@ class Task(Element):
                      clock=0)
 
     def __init__(self, **fields):
-        super(Task, self).__init__(**dict(self._defaults, **fields))
+        dict.__init__(self, self._defaults, **fields)
 
     def update(self, state, timestamp, fields):
         """Update state from new event.
@@ -262,7 +288,7 @@ class Task(Element):
         return dict(_keys())
 
     def __repr__(self):
-        return '<Task: {0.name}({0.uuid}) {0.state}>'.format(self)
+        return R_TASK.format(self)
 
     @property
     def ready(self):
@@ -275,14 +301,20 @@ class State(object):
     task_count = 0
 
     def __init__(self, callback=None,
+                 workers=None, tasks=None, taskheap=None,
                  max_workers_in_memory=5000, max_tasks_in_memory=10000):
+        self.event_callback = callback
+        self.workers = (LRUCache(max_workers_in_memory)
+                        if workers is None else workers)
+        self.tasks = (LRUCache(max_tasks_in_memory)
+                      if tasks is None else tasks)
+        self._taskheap = [] if taskheap is None else taskheap
         self.max_workers_in_memory = max_workers_in_memory
         self.max_tasks_in_memory = max_tasks_in_memory
-        self.workers = LRUCache(limit=self.max_workers_in_memory)
-        self.tasks = LRUCache(limit=self.max_tasks_in_memory)
-        self._taskheap = []
-        self.event_callback = callback
         self._mutex = threading.Lock()
+        self.handlers = {'task': self.task_event,
+                         'worker': self.worker_event}
+        self._get_handler = self.handlers.__getitem__
 
     def freeze_while(self, fun, *args, **kwargs):
         clear_after = kwargs.pop('clear_after', False)
@@ -360,14 +392,14 @@ class State(object):
         worker, _ = self.get_or_create_worker(hostname)
         task, created = self.get_or_create_task(uuid)
         task.worker = worker
+        maxtasks = self.max_tasks_in_memory * 2
 
         taskheap = self._taskheap
         timestamp = fields.get('timestamp') or 0
         clock = 0 if type == 'sent' else fields.get('clock')
         heappush(taskheap, _lamportinfo(clock, timestamp, worker.id, task))
-        curcount = len(self.tasks)
-        if len(taskheap) > self.max_tasks_in_memory * 2:
-            taskheap[:] = taskheap[curcount:]
+        if len(taskheap) > maxtasks:
+            heappop(taskheap)
 
         handler = getattr(task, 'on_' + type, None)
         if type == 'received':
@@ -382,11 +414,14 @@ class State(object):
         with self._mutex:
             return self._dispatch_event(event)
 
-    def _dispatch_event(self, event):
+    def _dispatch_event(self, event, kwdict=kwdict):
         self.event_count += 1
         event = kwdict(event)
         group, _, subject = event['type'].partition('-')
-        getattr(self, group + '_event')(subject, event)
+        try:
+            self._get_handler(group)(subject, event)
+        except KeyError:
+            pass
         if self.event_callback:
             self.event_callback(self, event)
 
@@ -438,15 +473,12 @@ class State(object):
         return [w for w in values(self.workers) if w.alive]
 
     def __repr__(self):
-        return '<State: events={0.event_count} tasks={0.task_count}>' \
-            .format(self)
+        return R_STATE.format(self)
 
-    def __getstate__(self):
-        d = dict(vars(self))
-        d.pop('_mutex')
-        return d
+    def __reduce__(self):
+        return self.__class__, (
+            self.event_callback, self.workers, self.tasks, self._taskheap,
+            self.max_workers_in_memory, self.max_tasks_in_memory,
+        )
 
-    def __setstate__(self, state):
-        self.__dict__ = state
-        self._mutex = threading.Lock()
 state = State()

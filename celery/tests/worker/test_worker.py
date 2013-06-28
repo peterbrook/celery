@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 
+import os
 import socket
 
 from collections import deque
@@ -13,12 +14,11 @@ from kombu.exceptions import StdChannelError
 from kombu.transport.base import Message
 from mock import call, Mock, patch
 
-from celery import current_app
 from celery.app.defaults import DEFAULTS
 from celery.bootsteps import RUN, CLOSE, TERMINATE, StartStopStep
 from celery.concurrency.base import BasePool
 from celery.datastructures import AttributeDict
-from celery.exceptions import SystemTerminate
+from celery.exceptions import SystemTerminate, TaskRevokedError
 from celery.five import Empty, range, Queue as FastQueue
 from celery.task import task as task_dec
 from celery.task import periodic_task as periodic_task_dec
@@ -29,16 +29,17 @@ from celery.worker import consumer
 from celery.worker.consumer import Consumer as __Consumer
 from celery.worker.hub import READ, ERR
 from celery.worker.job import Request
+from celery.utils import worker_direct
 from celery.utils.serialization import pickle
 from celery.utils.timer2 import Timer
 
-from celery.tests.utils import AppCase, Case
+from celery.tests.case import AppCase, Case
 
 
 def MockStep(step=None):
     step = Mock() if step is None else step
-    step.namespace = Mock()
-    step.namespace.name = 'MockNS'
+    step.blueprint = Mock()
+    step.blueprint.name = 'MockNS'
     step.name = 'MockStep(%s)' % (id(step), )
     return step
 
@@ -48,7 +49,7 @@ class PlaceHolder(object):
 
 
 def find_step(obj, typ):
-    return obj.namespace.steps[typ.name]
+    return obj.blueprint.steps[typ.name]
 
 
 class Consumer(__Consumer):
@@ -232,13 +233,13 @@ class test_QoS(Case):
         qos.set(qos.prev)
 
 
-class test_Consumer(Case):
+class test_Consumer(AppCase):
 
-    def setUp(self):
+    def setup(self):
         self.buffer = FastQueue()
         self.timer = Timer()
 
-    def tearDown(self):
+    def teardown(self):
         self.timer.stop()
 
     def test_info(self):
@@ -257,28 +258,28 @@ class test_Consumer(Case):
 
     def test_start_when_closed(self):
         l = MyKombuConsumer(self.buffer.put, timer=self.timer)
-        l.namespace.state = CLOSE
+        l.blueprint.state = CLOSE
         l.start()
 
     def test_connection(self):
         l = MyKombuConsumer(self.buffer.put, timer=self.timer)
 
-        l.namespace.start(l)
+        l.blueprint.start(l)
         self.assertIsInstance(l.connection, Connection)
 
-        l.namespace.state = RUN
+        l.blueprint.state = RUN
         l.event_dispatcher = None
-        l.namespace.restart(l)
+        l.blueprint.restart(l)
         self.assertTrue(l.connection)
 
-        l.namespace.state = RUN
+        l.blueprint.state = RUN
         l.shutdown()
         self.assertIsNone(l.connection)
         self.assertIsNone(l.task_consumer)
 
-        l.namespace.start(l)
+        l.blueprint.start(l)
         self.assertIsInstance(l.connection, Connection)
-        l.namespace.restart(l)
+        l.blueprint.restart(l)
 
         l.stop()
         l.shutdown()
@@ -287,7 +288,7 @@ class test_Consumer(Case):
 
     def test_close_connection(self):
         l = MyKombuConsumer(self.buffer.put, timer=self.timer)
-        l.namespace.state = RUN
+        l.blueprint.state = RUN
         step = find_step(l, consumer.Connection)
         conn = l.connection = Mock()
         step.shutdown(l)
@@ -298,7 +299,7 @@ class test_Consumer(Case):
         eventer = l.event_dispatcher = Mock()
         eventer.enabled = True
         heart = l.heart = MockHeart()
-        l.namespace.state = RUN
+        l.blueprint.state = RUN
         Events = find_step(l, consumer.Events)
         Events.shutdown(l)
         Heart = find_step(l, consumer.Heart)
@@ -431,7 +432,7 @@ class test_Consumer(Case):
 
     def test_loop_ignores_socket_timeout(self):
 
-        class Connection(current_app.connection().__class__):
+        class Connection(self.app.connection().__class__):
             obj = None
 
             def drain_events(self, **kwargs):
@@ -447,7 +448,7 @@ class test_Consumer(Case):
 
     def test_loop_when_socket_error(self):
 
-        class Connection(current_app.connection().__class__):
+        class Connection(self.app.connection().__class__):
             obj = None
 
             def drain_events(self, **kwargs):
@@ -455,7 +456,7 @@ class test_Consumer(Case):
                 raise socket.error('foo')
 
         l = Consumer(self.buffer.put, timer=self.timer)
-        l.namespace.state = RUN
+        l.blueprint.state = RUN
         c = l.connection = Connection()
         l.connection.obj = l
         l.task_consumer = Mock()
@@ -463,13 +464,13 @@ class test_Consumer(Case):
         with self.assertRaises(socket.error):
             l.loop(*l.loop_args())
 
-        l.namespace.state = CLOSE
+        l.blueprint.state = CLOSE
         l.connection = c
         l.loop(*l.loop_args())
 
     def test_loop(self):
 
-        class Connection(current_app.connection().__class__):
+        class Connection(self.app.connection().__class__):
             obj = None
 
             def drain_events(self, **kwargs):
@@ -517,9 +518,11 @@ class test_Consumer(Case):
     def test_receieve_message_eta_isoformat(self):
         l = _MyKombuConsumer(self.buffer.put, timer=self.timer)
         l.steps.pop()
-        m = create_message(Mock(), task=foo_task.name,
-                           eta=datetime.now().isoformat(),
-                           args=[2, 4, 8], kwargs={})
+        m = create_message(
+            Mock(), task=foo_task.name,
+            eta=(datetime.now() + timedelta(days=1)).isoformat(),
+            args=[2, 4, 8], kwargs={},
+        )
 
         l.task_consumer = Mock()
         l.qos = QoS(l.task_consumer.qos, 1)
@@ -620,14 +623,14 @@ class test_Consumer(Case):
             eta=(datetime.now() + timedelta(days=1)).isoformat(),
         )
 
-        l.namespace.start(l)
+        l.blueprint.start(l)
         p = l.app.conf.BROKER_CONNECTION_RETRY
         l.app.conf.BROKER_CONNECTION_RETRY = False
         try:
-            l.namespace.start(l)
+            l.blueprint.start(l)
         finally:
             l.app.conf.BROKER_CONNECTION_RETRY = p
-        l.namespace.restart(l)
+        l.blueprint.restart(l)
         l.event_dispatcher = Mock()
         callback = self._get_on_message(l)
         callback(m.decode(), m)
@@ -804,7 +807,7 @@ class test_Consumer(Case):
         l = Consumer(self.buffer.put, timer=self.timer)
         l.steps.pop()
         self.assertEqual(None, l.pool)
-        l.namespace.start(l)
+        l.blueprint.start(l)
 
 
 class test_WorkController(AppCase):
@@ -824,8 +827,42 @@ class test_WorkController(AppCase):
 
     def create_worker(self, **kw):
         worker = self.app.WorkController(concurrency=1, loglevel=0, **kw)
-        worker.namespace.shutdown_complete.set()
+        worker.blueprint.shutdown_complete.set()
         return worker
+
+    def test_on_consumer_ready(self):
+        self.worker.on_consumer_ready(Mock())
+
+    def test_setup_queues_worker_direct(self):
+        self.app.conf.CELERY_WORKER_DIRECT = True
+        _qs, self.app.amqp.__dict__['queues'] = self.app.amqp.queues, Mock()
+        try:
+            self.worker.setup_queues({})
+            self.app.amqp.queues.select_add.assert_called_with(
+                worker_direct(self.worker.hostname),
+            )
+        finally:
+            self.app.amqp.queues = _qs
+            self.app.conf.CELERY_WORKER_DIRECT = False
+
+    def test_send_worker_shutdown(self):
+        with patch('celery.signals.worker_shutdown') as ws:
+            self.worker._send_worker_shutdown()
+            ws.send.assert_called_with(sender=self.worker)
+
+    def test_process_task_revoked_release_semaphore(self):
+        self.worker._quick_release = Mock()
+        req = Mock()
+        req.execute_using_pool.side_effect = TaskRevokedError
+        self.worker._process_task(req)
+        self.worker._quick_release.assert_called_with()
+
+        delattr(self.worker, '_quick_release')
+        self.worker._process_task(req)
+
+    def test_shutdown_no_blueprint(self):
+        self.worker.blueprint = None
+        self.worker._shutdown()
 
     @patch('celery.platforms.create_pidlock')
     def test_use_pidfile(self, create_pidlock):
@@ -867,6 +904,14 @@ class test_WorkController(AppCase):
             'celeryd', hostname='awesome.worker.com',
         )
 
+        with patch('celery.task.trace.setup_worker_optimizations') as swo:
+            os.environ['FORKED_BY_MULTIPROCESSING'] = "1"
+            try:
+                process_initializer(app, 'luke.worker.com')
+                swo.assert_called_with(app)
+            finally:
+                os.environ.pop('FORKED_BY_MULTIPROCESSING', None)
+
     def test_attrs(self):
         worker = self.worker
         self.assertIsInstance(worker.timer, Timer)
@@ -890,17 +935,17 @@ class test_WorkController(AppCase):
     def test_dont_stop_or_terminate(self):
         worker = WorkController(concurrency=1, loglevel=0)
         worker.stop()
-        self.assertNotEqual(worker.namespace.state, CLOSE)
+        self.assertNotEqual(worker.blueprint.state, CLOSE)
         worker.terminate()
-        self.assertNotEqual(worker.namespace.state, CLOSE)
+        self.assertNotEqual(worker.blueprint.state, CLOSE)
 
         sigsafe, worker.pool.signal_safe = worker.pool.signal_safe, False
         try:
-            worker.namespace.state = RUN
+            worker.blueprint.state = RUN
             worker.stop(in_sighandler=True)
-            self.assertNotEqual(worker.namespace.state, CLOSE)
+            self.assertNotEqual(worker.blueprint.state, CLOSE)
             worker.terminate(in_sighandler=True)
-            self.assertNotEqual(worker.namespace.state, CLOSE)
+            self.assertNotEqual(worker.blueprint.state, CLOSE)
         finally:
             worker.pool.signal_safe = sigsafe
 
@@ -943,10 +988,10 @@ class test_WorkController(AppCase):
                            kwargs={})
         task = Request.from_message(m, m.decode())
         worker.steps = []
-        worker.namespace.state = RUN
+        worker.blueprint.state = RUN
         with self.assertRaises(KeyboardInterrupt):
             worker._process_task(task)
-        self.assertEqual(worker.namespace.state, TERMINATE)
+        self.assertEqual(worker.blueprint.state, TERMINATE)
 
     def test_process_task_raise_SystemTerminate(self):
         worker = self.worker
@@ -957,10 +1002,10 @@ class test_WorkController(AppCase):
                            kwargs={})
         task = Request.from_message(m, m.decode())
         worker.steps = []
-        worker.namespace.state = RUN
+        worker.blueprint.state = RUN
         with self.assertRaises(SystemExit):
             worker._process_task(task)
-        self.assertEqual(worker.namespace.state, TERMINATE)
+        self.assertEqual(worker.blueprint.state, TERMINATE)
 
     def test_process_task_raise_regular(self):
         worker = self.worker
@@ -1021,10 +1066,10 @@ class test_WorkController(AppCase):
 
     def test_start__stop(self):
         worker = self.worker
-        worker.namespace.shutdown_complete.set()
+        worker.blueprint.shutdown_complete.set()
         worker.steps = [MockStep(StartStopStep(self)) for _ in range(4)]
-        worker.namespace.state = RUN
-        worker.namespace.started = 4
+        worker.blueprint.state = RUN
+        worker.blueprint.started = 4
         for w in worker.steps:
             w.start = Mock()
             w.close = Mock()
@@ -1063,15 +1108,15 @@ class test_WorkController(AppCase):
 
     def test_start__terminate(self):
         worker = self.worker
-        worker.namespace.shutdown_complete.set()
-        worker.namespace.started = 5
-        worker.namespace.state = RUN
+        worker.blueprint.shutdown_complete.set()
+        worker.blueprint.started = 5
+        worker.blueprint.state = RUN
         worker.steps = [MockStep() for _ in range(5)]
         worker.start()
         for w in worker.steps[:3]:
             self.assertTrue(w.start.call_count)
-        self.assertTrue(worker.namespace.started, len(worker.steps))
-        self.assertEqual(worker.namespace.state, RUN)
+        self.assertTrue(worker.blueprint.started, len(worker.steps))
+        self.assertEqual(worker.blueprint.state, RUN)
         worker.terminate()
         for step in worker.steps:
             self.assertTrue(step.terminate.call_count)
@@ -1113,14 +1158,14 @@ class test_WorkController(AppCase):
 
         from celery.concurrency.processes import TaskPool as _TaskPool
 
-        class TaskPool(_TaskPool):
+        class MockTaskPool(_TaskPool):
             Pool = PoolImp
 
             @property
             def timers(self):
                 return {Mock(): 30}
 
-        w.pool_cls = TaskPool
+        w.pool_cls = MockTaskPool
         w.use_eventloop = True
         w.consumer.restart_count = -1
         pool = components.Pool(w)

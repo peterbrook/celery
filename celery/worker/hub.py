@@ -8,8 +8,6 @@
 """
 from __future__ import absolute_import
 
-from functools import wraps
-
 from kombu.utils import cached_property
 from kombu.utils import eventio
 from kombu.utils.eventio import READ, WRITE, ERR
@@ -30,20 +28,11 @@ def repr_flag(flag):
 
 
 def _rcb(obj):
+    if obj is None:
+        return '<missing>'
     if isinstance(obj, str):
         return obj
     return obj.__name__
-
-
-def coroutine(gen):
-
-    @wraps(gen)
-    def advances(*args, **kwargs):
-        it = gen(*args, **kwargs)
-        next(it)
-        return it
-
-    return advances
 
 
 class BoundedSemaphore(object):
@@ -160,33 +149,6 @@ class Hub(object):
         self.on_init = []
         self.on_close = []
         self.on_task = []
-        self.coros = {}
-
-        self.trampoline = self._trampoline()
-
-    @coroutine
-    def _trampoline(self):
-        coros = self.coros
-        add = self.add_coro
-        remove_self = self.remove
-        pop = self.coros.pop
-
-        while 1:
-            fd, events = (yield)
-            remove_self(fd)
-            try:
-                gen = coros[fd]
-            except KeyError:
-                pass
-            else:
-                try:
-                    next(gen)
-                    add(fd, gen, WRITE)
-                except StopIteration:
-                    pop(fd, None)
-                except Exception:
-                    pop(fd, None)
-                    raise
 
     def start(self):
         """Called by Hub bootstep at worker startup."""
@@ -217,6 +179,10 @@ class Hub(object):
         return min(max(delay or 0, min_delay), max_delay)
 
     def _add(self, fd, cb, flags):
+        #if flags & WRITE:
+        #    ex = self.writers.get(fd)
+        #    if ex and ex.__name__ == '_write_job':
+        #        assert not ex.gi_frame or ex.gi_frame == -1
         self.poller.register(fd, flags)
         (self.readers if flags & READ else self.writers)[fileno(fd)] = cb
 
@@ -231,15 +197,6 @@ class Hub(object):
         fd = fileno(fd)
         self._unregister(fd)
         self._discard(fd)
-
-    def add_coro(self, fds, coro, flags):
-        for fd in (fileno(f) for f in maybe_list(fds, None)):
-            self._add(fd, self.trampoline, flags)
-            self.coros[fd] = coro
-
-    def remove_coro(self, fds):
-        for fd in maybe_list(fds, None):
-            self.coros.pop(fileno(fd), None)
 
     def add_reader(self, fds, callback):
         return self.add(fds, callback, READ | ERR)
@@ -264,10 +221,6 @@ class Hub(object):
         self.readers.pop(fd, None)
         self.writers.pop(fd, None)
 
-    def __enter__(self):
-        self.init()
-        return self
-
     def close(self, *args):
         [self._unregister(fd) for fd in self.readers]
         self.readers.clear()
@@ -275,14 +228,13 @@ class Hub(object):
         self.writers.clear()
         for callback in self.on_close:
             callback(self)
-    __exit__ = close
 
     def _repr_readers(self):
-        return ['{0}->{1}'.format(_rcb(cb), repr_flag(READ | ERR, fd))
+        return ['({0}){1}->{2}'.format(fd, _rcb(cb), repr_flag(READ | ERR))
                 for fd, cb in items(self.readers)]
 
     def _repr_writers(self):
-        return ['{0}->{1}'.format(_rcb(cb), repr_flag(WRITE, fd))
+        return ['({0}){1}->{2}'.format(fd, _rcb(cb), repr_flag(WRITE))
                 for fd, cb in items(self.writers)]
 
     def repr_active(self):
@@ -299,8 +251,6 @@ class Hub(object):
 
     def _callback_for(self, fd, flag, *default):
         try:
-            if fd in self.coros:
-                return self.coros[fd]
             if flag & READ:
                 return self.readers[fileno(fd)]
             if flag & WRITE:

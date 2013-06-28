@@ -16,14 +16,13 @@ import sys
 import platform
 import shelve
 
-from collections import defaultdict
-
 from kombu.serialization import pickle_protocol
 from kombu.utils import cached_property
 
 from celery import __version__
-from celery.exceptions import SystemTerminate
 from celery.datastructures import LimitedSet
+from celery.exceptions import SystemTerminate
+from celery.five import Counter
 
 #: Worker software/platform information.
 SOFTWARE_INFO = {'sw_ident': 'py-celery',
@@ -44,7 +43,7 @@ reserved_requests = set()
 active_requests = set()
 
 #: count of tasks accepted by the worker, sorted by type.
-total_count = defaultdict(int)
+total_count = Counter()
 
 #: the list of currently revoked tasks.  Persistent if statedb set.
 revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)

@@ -21,6 +21,7 @@ import sys
 
 from warnings import warn
 
+from billiard.einfo import ExceptionInfo
 from kombu.utils import kwdict
 
 from celery import current_app
@@ -28,11 +29,13 @@ from celery import states, signals
 from celery._state import _task_stack
 from celery.app import set_default_app
 from celery.app.task import Task as BaseTask, Context
-from celery.datastructures import ExceptionInfo
 from celery.exceptions import Ignore, RetryTaskError
 from celery.utils.log import get_logger
 from celery.utils.objects import mro_lookup
-from celery.utils.serialization import get_pickleable_exception
+from celery.utils.serialization import (
+    get_pickleable_exception,
+    get_pickleable_etype,
+)
 
 _logger = get_logger(__name__)
 
@@ -100,7 +103,9 @@ class TraceInfo(object):
         type_, _, tb = sys.exc_info()
         try:
             exc = self.retval
-            einfo = ExceptionInfo((type_, get_pickleable_exception(exc), tb))
+            einfo = ExceptionInfo()
+            einfo.exception = get_pickleable_exception(einfo.exception)
+            einfo.type = get_pickleable_etype(einfo.type)
             if store_errors:
                 task.backend.mark_as_failure(req.id, exc, einfo.traceback)
             task.on_failure(exc, req.id, req.args, req.kwargs, einfo)
@@ -117,23 +122,22 @@ class TraceInfo(object):
 def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                  Info=TraceInfo, eager=False, propagate=False,
                  IGNORE_STATES=IGNORE_STATES):
-    """Builts a function that tracing the tasks execution; catches all
-    exceptions, and saves the state and result of the task execution
-    to the result backend.
+    """Returns a function that traces task execution; catches all
+    exceptions and updates result backend with the state and result
 
     If the call was successful, it saves the result to the task result
     backend, and sets the task status to `"SUCCESS"`.
 
     If the call raises :exc:`~celery.exceptions.RetryTaskError`, it extracts
-    the original exception, uses that as the result and sets the task status
+    the original exception, uses that as the result and sets the task state
     to `"RETRY"`.
 
     If the call results in an exception, it saves the exception as the task
-    result, and sets the task status to `"FAILURE"`.
+    result, and sets the task state to `"FAILURE"`.
 
     Returns a function that takes the following arguments:
 
-        :param uuid: The unique id of the task.
+        :param uuid: The id of the task.
         :param args: List of positional args to pass on to the function.
         :param kwargs: Keyword arguments mapping to pass on to the function.
         :keyword request: Request dict.
@@ -256,6 +260,8 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                     except Exception as exc:
                         _logger.error('Process cleanup failed: %r', exc,
                                       exc_info=True)
+        except MemoryError:
+            raise
         except Exception as exc:
             if eager:
                 raise
@@ -329,13 +335,9 @@ def setup_worker_optimizations(app):
     _tasks = app._tasks
 
     trace_task_ret = _fast_trace_task
-    try:
-        job = sys.modules['celery.worker.job']
-    except KeyError:
-        pass
-    else:
-        job.trace_task_ret = _fast_trace_task
-        job.__optimize__()
+    from celery.worker import job as job_module
+    job_module.trace_task_ret = _fast_trace_task
+    job_module.__optimize__()
 
 
 def reset_worker_optimizations():
@@ -349,10 +351,8 @@ def reset_worker_optimizations():
         BaseTask.__call__ = _patched.pop('BaseTask.__call__')
     except KeyError:
         pass
-    try:
-        sys.modules['celery.worker.job'].trace_task_ret = _trace_task_ret
-    except KeyError:
-        pass
+    from celery.worker import job as job_module
+    job_module.trace_task_ret = _trace_task_ret
 
 
 def _install_stack_protection():

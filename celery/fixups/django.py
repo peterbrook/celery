@@ -4,12 +4,14 @@ import os
 import sys
 import warnings
 
+from kombu.utils import symbol_by_name
+
 from datetime import datetime
+from importlib import import_module
 
 from celery import signals
 from celery.exceptions import FixupWarning
 
-SETTINGS_MODULE = os.environ.get('DJANGO_SETTINGS_MODULE')
 ERR_NOT_INSTALLED = """\
 Environment variable DJANGO_SETTINGS_MODULE is defined
 but Django is not installed.  Will not apply Django fixups!
@@ -24,32 +26,36 @@ def _maybe_close_fd(fh):
         pass
 
 
-def fixup(app):
+def fixup(app, env='DJANGO_SETTINGS_MODULE'):
+    SETTINGS_MODULE = os.environ.get(env)
     if SETTINGS_MODULE:
         try:
             import django  # noqa
         except ImportError:
             warnings.warn(FixupWarning(ERR_NOT_INSTALLED))
-        return DjangoFixup(app).install()
+        else:
+            return DjangoFixup(app).install()
 
 
 class DjangoFixup(object):
     _db_recycles = 0
 
     def __init__(self, app):
-        from django import db
-        from django.core import cache
-        from django.conf import settings
-        from django.core.mail import mail_admins
+        self.app = app
+        self.db_reuse_max = self.app.conf.get('CELERY_DB_REUSE_MAX', None)
+        self._db = import_module('django.db')
+        self._cache = import_module('django.core.cache')
+        self._settings = symbol_by_name('django.conf:settings')
+        self._mail_admins = symbol_by_name('django.core.mail:mail_admins')
 
         # Current time and date
         try:
-            from django.utils.timezone import now
+            self._now = symbol_by_name('django.utils.timezone:now')
         except ImportError:  # pre django-1.4
-            now = datetime.now  # noqa
+            self._now = datetime.now  # noqa
 
         # Database-related exceptions.
-        from django.db import DatabaseError
+        DatabaseError = symbol_by_name('django.db:DatabaseError')
         try:
             import MySQLdb as mysql
             _my_database_errors = (mysql.DatabaseError,
@@ -79,19 +85,18 @@ class DjangoFixup(object):
         except ImportError:
             _oracle_database_errors = ()  # noqa
 
-        self.app = app
-        self.db_reuse_max = self.app.conf.get('CELERY_DB_REUSE_MAX', None)
-        self._cache = cache
-        self._settings = settings
-        self._db = db
-        self._mail_admins = mail_admins
-        self._now = now
+        try:
+            self._close_old_connections = symbol_by_name(
+                'django.db:close_old_connections',
+            )
+        except (ImportError, AttributeError):
+            self._close_old_connections = None
         self.database_errors = (
             (DatabaseError, ) +
             _my_database_errors +
             _pg_database_errors +
             _lite_database_errors +
-            _oracle_database_errors,
+            _oracle_database_errors
         )
 
     def install(self):
@@ -161,6 +166,8 @@ class DjangoFixup(object):
         self.close_cache()
 
     def close_database(self, **kwargs):
+        if self._close_old_connections:
+            return self._close_old_connections()  # Django 1.6
         if not self.db_reuse_max:
             return self._close_database()
         if self._db_recycles >= self.db_reuse_max * 2:

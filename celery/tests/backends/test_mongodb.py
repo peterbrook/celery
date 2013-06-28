@@ -12,7 +12,7 @@ from celery import states
 from celery.backends import mongodb as module
 from celery.backends.mongodb import MongoBackend, Bunch, pymongo
 from celery.exceptions import ImproperlyConfigured
-from celery.tests.utils import AppCase
+from celery.tests.case import AppCase
 
 COLLECTION = 'taskmeta_celery'
 TASK_ID = str(uuid.uuid1())
@@ -289,7 +289,7 @@ class test_MongoBackend(AppCase):
         mock_database.__getitem__.assert_called_once_with(
             MONGODB_COLLECTION)
         mock_collection.remove.assert_called_once_with(
-            {'_id': sentinel.task_id}, safe=True)
+            {'_id': sentinel.task_id})
 
     @patch('celery.backends.mongodb.MongoBackend._get_database')
     def test_cleanup(self, mock_get_database):

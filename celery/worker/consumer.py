@@ -10,8 +10,10 @@ up and running.
 """
 from __future__ import absolute_import
 
+import errno
 import kombu
 import logging
+import os
 import socket
 
 from collections import defaultdict
@@ -24,12 +26,14 @@ from billiard.common import restart_state
 from billiard.exceptions import RestartFreqExceeded
 from kombu.common import QoS, ignore_errors
 from kombu.syn import _detect_environment
+from kombu.utils.compat import get_errno
 from kombu.utils.encoding import safe_repr, bytes_t
 from kombu.utils.limits import TokenBucket
 
 from celery import bootsteps
 from celery.app import app_or_default
 from celery.canvas import subtask
+from celery.exceptions import InvalidTaskError
 from celery.five import items, values
 from celery.task.trace import build_tracer
 from celery.utils.functional import noop
@@ -40,6 +44,13 @@ from celery.utils.timeutils import humanize_seconds, rate
 
 from . import heartbeat, loops, pidbox
 from .state import task_reserved, maybe_shutdown, revoked, reserved_requests
+
+try:
+    buffer_t = buffer
+except NameError:  # pragma: no cover
+
+    class buffer_t(object):  # noqa
+        pass
 
 CLOSE = bootsteps.CLOSE
 logger = get_logger(__name__)
@@ -99,9 +110,11 @@ MESSAGE_REPORT = """\
 body: {0} {{content_type:{1} content_encoding:{2} delivery_info:{3}}}\
 """
 
+MINGLE_GET_FIELDS = itemgetter('clock', 'revoked')
+
 
 def dump_body(m, body):
-    if isinstance(body, buffer):
+    if isinstance(body, buffer_t):
         body = bytes_t(buffer)
     return '{0} ({1}b)'.format(truncate(safe_repr(body), 1024),
                                len(m.body))
@@ -124,7 +137,7 @@ class Consumer(object):
 
     restart_count = -1  # first start is the same as a restart
 
-    class Namespace(bootsteps.Namespace):
+    class Blueprint(bootsteps.Blueprint):
         name = 'Consumer'
         default_steps = [
             'celery.worker.consumer:Connection',
@@ -141,7 +154,7 @@ class Consumer(object):
         def shutdown(self, parent):
             self.send_all(parent, 'shutdown')
 
-    def __init__(self, handle_task,
+    def __init__(self, on_task,
                  init_callback=noop, hostname=None,
                  pool=None, app=None,
                  timer=None, controller=None, hub=None, amqheartbeat=None,
@@ -150,6 +163,7 @@ class Consumer(object):
         self.controller = controller
         self.init_callback = init_callback
         self.hostname = hostname or socket.gethostname()
+        self.pid = os.getpid()
         self.pool = pool
         self.timer = timer or default_timer
         self.strategies = {}
@@ -159,7 +173,7 @@ class Consumer(object):
         self._restart_state = restart_state(maxR=5, maxT=1)
 
         self._does_info = logger.isEnabledFor(logging.INFO)
-        self.handle_task = handle_task
+        self.on_task = on_task
         self.amqheartbeat_rate = self.app.conf.BROKER_HEARTBEAT_CHECKRATE
         self.disable_rate_limits = disable_rate_limits
 
@@ -188,10 +202,10 @@ class Consumer(object):
             self.app.conf.BROKER_CONNECTION_TIMEOUT = None
 
         self.steps = []
-        self.namespace = self.Namespace(
+        self.blueprint = self.Blueprint(
             app=self.app, on_close=self.on_close,
         )
-        self.namespace.apply(self, **dict(worker_options or {}, **kwargs))
+        self.blueprint.apply(self, **dict(worker_options or {}, **kwargs))
 
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
@@ -210,36 +224,39 @@ class Consumer(object):
             )
         else:
             task_reserved(request)
-            self.handle_task(request)
+            self.on_task(request)
 
     def start(self):
-        ns, loop = self.namespace, self.loop
-        while ns.state != CLOSE:
+        blueprint, loop = self.blueprint, self.loop
+        while blueprint.state != CLOSE:
             self.restart_count += 1
             maybe_shutdown()
             try:
-                ns.start(self)
-            except self.connection_errors:
+                blueprint.start(self)
+            except self.connection_errors as exc:
+                if isinstance(exc, OSError) and get_errno(exc) == errno.EMFILE:
+                    raise  # Too many open files
                 maybe_shutdown()
                 try:
                     self._restart_state.step()
                 except RestartFreqExceeded as exc:
                     crit('Frequent restarts detected: %r', exc, exc_info=1)
                     sleep(1)
-                if ns.state != CLOSE and self.connection:
+                if blueprint.state != CLOSE and self.connection:
                     warn(CONNECTION_RETRY, exc_info=True)
                     try:
                         self.connection.collect()
                     except Exception:
                         pass
-                    ns.restart(self)
+                    self.on_close()
+                    blueprint.restart(self)
 
     def shutdown(self):
         self.in_shutdown = True
-        self.namespace.shutdown(self)
+        self.blueprint.shutdown(self)
 
     def stop(self):
-        self.namespace.stop(self)
+        self.blueprint.stop(self)
 
     def on_ready(self):
         callback, self.init_callback = self.init_callback, None
@@ -248,9 +265,7 @@ class Consumer(object):
 
     def loop_args(self):
         return (self, self.connection, self.task_consumer,
-                self.strategies, self.namespace, self.hub, self.qos,
-                self.amqheartbeat, self.handle_unknown_message,
-                self.handle_unknown_task, self.handle_invalid_task,
+                self.blueprint, self.hub, self.qos, self.amqheartbeat,
                 self.app.clock, self.amqheartbeat_rate)
 
     def on_poll_init(self, hub):
@@ -344,7 +359,7 @@ class Consumer(object):
         """Method called by the timer to apply a task with an
         ETA/countdown."""
         task_reserved(task)
-        self.handle_task(task)
+        self.on_task(task)
         self.qos.decrement_eventually()
 
     def _message_report(self, body, message):
@@ -353,15 +368,15 @@ class Consumer(object):
                                      safe_repr(message.content_encoding),
                                      safe_repr(message.delivery_info))
 
-    def handle_unknown_message(self, body, message):
+    def on_unknown_message(self, body, message):
         warn(UNKNOWN_FORMAT, self._message_report(body, message))
         message.reject_log_error(logger, self.connection_errors)
 
-    def handle_unknown_task(self, body, message, exc):
+    def on_unknown_task(self, body, message, exc):
         error(UNKNOWN_TASK_ERROR, exc, dump_body(message, body), exc_info=True)
         message.reject_log_error(logger, self.connection_errors)
 
-    def handle_invalid_task(self, body, message, exc):
+    def on_invalid_task(self, body, message, exc):
         error(INVALID_TASK_ERROR, exc, dump_body(message, body), exc_info=True)
         message.reject_log_error(logger, self.connection_errors)
 
@@ -370,6 +385,29 @@ class Consumer(object):
         for name, task in items(self.app.tasks):
             self.strategies[name] = task.start_strategy(self.app, self)
             task.__trace__ = build_tracer(name, task, loader, self.hostname)
+
+    def create_task_handler(self, callbacks):
+        strategies = self.strategies
+        on_unknown_message = self.on_unknown_message
+        on_unknown_task = self.on_unknown_task
+        on_invalid_task = self.on_invalid_task
+
+        def on_task_received(body, message):
+            if callbacks:
+                [callback() for callback in callbacks]
+            try:
+                name = body['task']
+            except (KeyError, TypeError):
+                return on_unknown_message(body, message)
+
+            try:
+                strategies[name](message, body, message.ack_log_error)
+            except KeyError as exc:
+                on_unknown_task(body, message, exc)
+            except InvalidTaskError as exc:
+                on_invalid_task(body, message, exc)
+
+        return on_task_received
 
 
 class Connection(bootsteps.StartStopStep):
@@ -503,8 +541,13 @@ class Mingle(bootsteps.StartStopStep):
         replies = I.hello()
         if replies:
             for reply in values(replies):
-                c.app.clock.adjust(reply['clock'])
-                revoked.update(reply['revoked'])
+                try:
+                    other_clock, other_revoked = MINGLE_GET_FIELDS(reply)
+                except KeyError:  # reply from pre-3.1 worker
+                    pass
+                else:
+                    c.app.clock.adjust(other_clock)
+                    revoked.update(other_revoked)
             info('mingle: synced with %s', ', '.join(replies))
         else:
             info('mingle: no one here')
@@ -514,7 +557,7 @@ class Gossip(bootsteps.ConsumerStep):
     label = 'Gossip'
     requires = (Events, )
     _cons_stamp_fields = itemgetter(
-        'clock', 'hostname', 'pid', 'topic', 'action',
+        'id', 'clock', 'hostname', 'pid', 'topic', 'action', 'cver',
     )
 
     def __init__(self, c, enable_gossip=True, interval=5.0, **kwargs):
@@ -523,6 +566,7 @@ class Gossip(bootsteps.ConsumerStep):
         c.gossip = self
         self.Receiver = c.app.events.Receiver
         self.hostname = c.hostname
+        self.full_hostname = '.'.join([self.hostname, str(c.pid)])
 
         self.timer = c.timer
         self.state = c.app.events.State()
@@ -543,7 +587,10 @@ class Gossip(bootsteps.ConsumerStep):
 
     def election(self, id, topic, action=None):
         self.consensus_replies[id] = []
-        self.dispatcher.send('worker-elect', id=id, topic=topic, action=action)
+        self.dispatcher.send(
+            'worker-elect',
+            id=id, topic=topic, action=action, cver=1,
+        )
 
     def call_task(self, task):
         try:
@@ -553,13 +600,16 @@ class Gossip(bootsteps.ConsumerStep):
             error('Could not call task: %r', exc, exc_info=1)
 
     def on_elect(self, event):
-        id = event['id']
-        self.dispatcher.send('worker-elect-ack', id=id)
-        clock, hostname, pid, topic, action = self._cons_stamp_fields(event)
+        try:
+            (id_, clock, hostname, pid,
+             topic, action, _) = self._cons_stamp_fields(event)
+        except KeyError as exc:
+            return error('election request missing field %s', exc, exc_info=1)
         heappush(
-            self.consensus_requests[id],
+            self.consensus_requests[id_],
             (clock, '%s.%s' % (hostname, pid), topic, action),
         )
+        self.dispatcher.send('worker-elect-ack', id=id_)
 
     def start(self, c):
         super(Gossip, self).start(c)
@@ -570,15 +620,15 @@ class Gossip(bootsteps.ConsumerStep):
         try:
             replies = self.consensus_replies[id]
         except KeyError:
-            return
+            return  # not for us
         alive_workers = self.state.alive_workers()
         replies.append(event['hostname'])
 
         if len(replies) >= len(alive_workers):
-            _, leader, topic, action = self.lock.sort_heap(
+            _, leader, topic, action = self.clock.sort_heap(
                 self.consensus_requests[id],
             )
-            if leader == self.hostname:
+            if leader == self.full_hostname:
                 info('I won the election %r', id)
                 try:
                     handler = self.election_handlers[topic]
@@ -603,15 +653,19 @@ class Gossip(bootsteps.ConsumerStep):
     def register_timer(self):
         if self._tref is not None:
             self._tref.cancel()
-        self.timer.apply_interval(self.interval * 1000.0, self.periodic)
+        self._tref = self.timer.apply_interval(
+            self.interval * 1000.0, self.periodic,
+        )
 
     def periodic(self):
-        for worker in values(self.state.workers):
+        workers = self.state.workers
+        dirty = set()
+        for worker in values(workers):
             if not worker.alive:
-                try:
-                    self.on_node_lost(worker)
-                finally:
-                    self.state.workers.pop(worker.hostname, None)
+                dirty.add(worker)
+                self.on_node_lost(worker)
+        for worker in dirty:
+            workers.pop(worker.hostname, None)
 
     def get_consumers(self, channel):
         self.register_timer()

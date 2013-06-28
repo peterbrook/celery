@@ -8,7 +8,8 @@
 """
 from __future__ import absolute_import
 
-import inspect
+from inspect import getmro
+from itertools import takewhile
 
 try:
     import cPickle as pickle
@@ -21,7 +22,7 @@ from .encoding import safe_repr
 #: List of base classes we probably don't want to reduce to.
 try:
     unwanted_base_classes = (StandardError, Exception, BaseException, object)
-except NameError:
+except NameError:  # pragma: no cover
     unwanted_base_classes = (Exception, BaseException, object)  # py3k
 
 
@@ -29,7 +30,8 @@ def subclass_exception(name, parent, module):  # noqa
     return type(name, (parent,), {'__module__': module})
 
 
-def find_nearest_pickleable_exception(exc):
+def find_pickleable_exception(exc, loads=pickle.loads,
+                              dumps=pickle.dumps):
     """With an exception instance, iterate over its super classes (by mro)
     and find the first super exception that is pickleable.  It does
     not go below :exc:`Exception` (i.e. it skips :exc:`Exception`,
@@ -44,30 +46,20 @@ def find_nearest_pickleable_exception(exc):
     :rtype :exc:`Exception`:
 
     """
-    cls = exc.__class__
-    getmro_ = getattr(cls, 'mro', None)
-
-    # old-style classes doesn't have mro()
-    if not getmro_:  # pragma: no cover
-        # all Py2.4 exceptions has a baseclass.
-        if not getattr(cls, '__bases__', ()):
-            return
-        # Use inspect.getmro() to traverse bases instead.
-        getmro_ = lambda: inspect.getmro(cls)
-
-    for supercls in getmro_():
-        if supercls in unwanted_base_classes:
-            # only BaseException and object, from here on down,
-            # we don't care about these.
-            return
+    exc_args = getattr(exc, 'args', [])
+    for supercls in itermro(exc.__class__, unwanted_base_classes):
         try:
-            exc_args = getattr(exc, 'args', [])
             superexc = supercls(*exc_args)
-            pickle.loads(pickle.dumps(superexc))
+            loads(dumps(superexc))
         except:
             pass
         else:
             return superexc
+find_nearest_pickleable_exception = find_pickleable_exception  # XXX compat
+
+
+def itermro(cls, stop):
+    return takewhile(lambda sup: sup not in stop, getmro(cls))
 
 
 def create_exception_cls(name, module, parent=None):
@@ -144,10 +136,17 @@ def get_pickleable_exception(exc):
         pass
     else:
         return exc
-    nearest = find_nearest_pickleable_exception(exc)
+    nearest = find_pickleable_exception(exc)
     if nearest:
         return nearest
     return UnpickleableExceptionWrapper.from_exception(exc)
+
+
+def get_pickleable_etype(cls, loads=pickle.loads, dumps=pickle.dumps):
+    try:
+        loads(dumps(cls))
+    except:
+        return Exception
 
 
 def get_pickled_exception(exc):

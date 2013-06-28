@@ -1,4 +1,4 @@
-.. _changelog:
+.. _changelog-3.0:
 
 ================
  Change history
@@ -8,6 +8,62 @@
     :local:
 
 If you're looking for versions prior to 3.0.x you should go to :ref:`history`.
+
+.. _version-3.0.20:
+
+3.0.20
+======
+:release-date: 2013-06-26 16:00 P.M BST
+
+- Now depends on :ref:`Kombu 2.5.11 <kombu:version-2.5.11>`.
+
+- ``--loader`` argument no longer supported importing loaders from the
+  current directory.
+
+- [Worker] Fixed memory leak when restarting after connection lost
+  (Issue #1325).
+
+- [Worker] Fixed unicode decode error at startup (Issue #1373).
+
+    Fix contributed by Jessica Tallon.
+
+- [Worker] Now properly rewrites unpickleable exceptions again.
+
+- Fixed possible race condition when evicting items from the revoked task set.
+
+- [generic-init.d] Fixed compatibility with Ubuntu's minimal Dash
+  shell (Issue #1387).
+
+    Fix contributed by monkut.
+
+- ``Task.apply``/``ALWAYS_EAGER`` now also executes callbacks and errbacks
+  (Issue #1336).
+
+- [Worker] The :signal:`worker-shutdown` signal was no longer being dispatched
+  (Issue #1339).
+
+- [Python 3] Fixed problem with threading.Event.
+
+    Fix contributed by Xavier Ordoquy.
+
+- [Python 3] Now handles ``io.UnsupportedOperation`` that may be raised
+  by ``file.fileno()`` in Python 3.
+
+- [MongoDB backend] No longer uses deprecated ``safe`` parameter.
+
+    Fix contributed by rfkrocktk
+
+- [Canvas] Fixed regression where immutable chord members may receive
+  arguments (Issue #1340).
+
+    Fix contributed by Peter Brook.
+
+- [Canvas] chain now accepts generator argument again (Issue #1319).
+
+- ``celery.migrate`` command now consumes from all queues if no queues
+  specified.
+
+    Fix contributed by John Watson.
 
 .. _version-3.0.19:
 
@@ -160,7 +216,7 @@ If you're looking for versions prior to 3.0.x you should go to :ref:`history`.
 
 - MongoDB Backend: The :setting:`MONGODB_BACKEND_SETTINGS` setting
   now accepts a ``option`` key that lets you forward arbitrary kwargs
-  to the underlying ``pymongo.Connection` object (Issue #1015).
+  to the underlying ``pymongo.Connection`` object (Issue #1015).
 
 - Beat: The daily backend cleanup task is no longer enabled
   for result backends that support automatic result expiration (Issue #1031).

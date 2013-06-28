@@ -27,6 +27,9 @@ from .five import items, range, string_t
 class ResultBase(object):
     """Base class for all results"""
 
+    #: Parent result (if part of a chain)
+    parent = None
+
 
 class AsyncResult(ResultBase):
     """Query task state.
@@ -46,9 +49,6 @@ class AsyncResult(ResultBase):
     #: The task result backend to use.
     backend = None
 
-    #: Parent result (if part of a chain)
-    parent = None
-
     def __init__(self, id, backend=None, task_name=None,
                  app=None, parent=None):
         self.app = app_or_default(app or self.app)
@@ -58,7 +58,7 @@ class AsyncResult(ResultBase):
         self.parent = parent
 
     def serializable(self):
-        return [self.id, self.parent and self.parent.id], None
+        return [self.id, self.parent and self.parent.serializable()], None
 
     def forget(self):
         """Forget about (and possibly remove the result of) this task."""
@@ -214,6 +214,9 @@ class AsyncResult(ResultBase):
             return other == self.id
         return NotImplemented
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def __copy__(self):
         r = self.__reduce__()
         return r[0](*r[1])
@@ -364,7 +367,7 @@ class ResultSet(ResultBase):
     def failed(self):
         """Did any of the tasks fail?
 
-        :returns: :const:`True` if any of the tasks failed.
+        :returns: :const:`True` if one of the tasks failed.
             (i.e., raised an exception)
 
         """
@@ -373,7 +376,7 @@ class ResultSet(ResultBase):
     def waiting(self):
         """Are any of the tasks incomplete?
 
-        :returns: :const:`True` if any of the tasks is still
+        :returns: :const:`True` if one of the tasks are still
             waiting for execution.
 
         """
@@ -382,7 +385,7 @@ class ResultSet(ResultBase):
     def ready(self):
         """Did all of the tasks complete? (either by success of failure).
 
-        :returns: :const:`True` if all of the tasks been
+        :returns: :const:`True` if all of the tasks has been
             executed.
 
         """
@@ -417,7 +420,7 @@ class ResultSet(ResultBase):
                 )
 
     def __iter__(self):
-        return self.iterate()
+        return iter(self.results)
 
     def __getitem__(self, index):
         """`res[i] -> res.results[i]`"""
@@ -561,6 +564,9 @@ class ResultSet(ResultBase):
             return other.results == self.results
         return NotImplemented
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def __repr__(self):
         return '<{0}: [{1}]>'.format(type(self).__name__,
                                      ', '.join(r.id for r in self.results))
@@ -624,6 +630,9 @@ class GroupResult(ResultSet):
         if isinstance(other, GroupResult):
             return other.id == self.id and other.results == self.results
         return NotImplemented
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def __repr__(self):
         return '<{0}: {1} [{2}]>'.format(type(self).__name__, self.id,
@@ -739,13 +748,14 @@ def from_serializable(r, app=None):
     app = app_or_default(app)
     Result = app.AsyncResult
     if not isinstance(r, ResultBase):
-        id = parent = None
         res, nodes = r
         if nodes:
             return app.GroupResult(
                 res, [from_serializable(child, app) for child in nodes],
             )
-        if isinstance(res, (list, tuple)):
-            id, parent = res[0], res[1]
+        # previously did not include parent
+        id, parent = res if isinstance(res, (list, tuple)) else (res, None)
+        if parent:
+            parent = from_serializable(parent, app)
         return Result(id, parent=parent)
     return r

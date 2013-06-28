@@ -10,6 +10,14 @@
 """
 from __future__ import absolute_import
 
+try:
+    from collections import Counter
+except ImportError:  # pragma: no cover
+    from collections import defaultdict
+
+    def Counter():
+        return defaultdict(int)
+
 ############## py3k #########################################################
 import sys
 PY3 = sys.version_info[0] == 3
@@ -30,7 +38,7 @@ except ImportError:                         # pragma: no cover
     from collections import UserDict        # noqa
 
 
-if PY3:
+if PY3:  # pragma: no cover
     import builtins
 
     from queue import Queue, Empty
@@ -99,7 +107,7 @@ else:
     def nextfun(it):                # noqa
         return it.next
 
-    def exec_(code, globs=None, locs=None):
+    def exec_(code, globs=None, locs=None):  # pragma: no cover
         """Execute code in a namespace."""
         if globs is None:
             frame = sys._getframe(1)
@@ -167,7 +175,12 @@ else:  # pragma: no cover
 import operator
 import sys
 
-from functools import reduce
+# import fails in python 2.5. fallback to reduce in stdlib
+try:
+    from functools import reduce
+except ImportError:
+    pass
+
 from importlib import import_module
 from types import ModuleType
 
@@ -288,7 +301,7 @@ class MagicModule(ModuleType):
             for item in self._all_by_module[module.__name__]:
                 setattr(self, item, getattr(module, item))
             return getattr(module, name)
-        elif name in self._direct:
+        elif name in self._direct:  # pragma: no cover
             module = __import__(self._direct[name], None, None, [name])
             setattr(self, name, module)
             return module

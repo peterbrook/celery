@@ -10,11 +10,12 @@ from __future__ import absolute_import
 
 import sys
 
+from billiard.einfo import ExceptionInfo
+
 from celery import current_app
 from celery import states
 from celery._state import get_current_worker_task, _task_stack
 from celery.canvas import subtask
-from celery.datastructures import ExceptionInfo
 from celery.exceptions import MaxRetriesExceededError, RetryTaskError
 from celery.five import class_property, items, with_metaclass
 from celery.result import EagerResult
@@ -25,6 +26,7 @@ from celery.utils.mail import ErrorMail
 
 from .annotations import resolve_all as resolve_all_annotations
 from .registry import _unpickle_task_v2
+from .utils import appstr
 
 #: extracts attributes related to publishing a message from an object.
 extract_exec_options = mattrgetter(
@@ -32,6 +34,29 @@ extract_exec_options = mattrgetter(
     'serializer', 'delivery_mode', 'compression', 'timeout', 'soft_timeout',
     'immediate', 'mandatory',  # imm+man is deprecated
 )
+
+# We take __repr__ very seriously around here ;)
+R_BOUND_TASK = '<class {0.__name__} of {app}{flags}>'
+R_UNBOUND_TASK = '<unbound {0.__name__}{flags}>'
+R_SELF_TASK = '<@task {0.name} bound to other {0.__self__}>'
+R_INSTANCE = '<@task: {0.name} of {app}{flags}>'
+
+
+def _strflags(flags, default=''):
+    if flags:
+        return ' ({0})'.format(', '.join(flags))
+    return default
+
+
+def _reprtask(task, fmt=None, flags=None):
+    flags = list(flags) if flags is not None else []
+    flags.append('v2 compatible') if task.__v2_compat__ else None
+    if not fmt:
+        fmt = R_BOUND_TASK if task._app else R_UNBOUND_TASK
+    return fmt.format(
+        task, flags=_strflags(flags),
+        app=appstr(task._app) if task._app else None,
+    )
 
 
 class Context(object):
@@ -124,11 +149,7 @@ class TaskType(type):
         return instance.__class__
 
     def __repr__(cls):
-        if cls._app:
-            return '<class {0.__name__} of {0._app}>'.format(cls)
-        if cls.__v2_compat__:
-            return '<unbound {0.__name__} (v2 compatible)>'.format(cls)
-        return '<unbound {0.__name__}>'.format(cls)
+        return _reprtask(cls)
 
 
 @with_metaclass(TaskType)
@@ -196,11 +217,11 @@ class Task(object):
     serializer = None
 
     #: Hard time limit.
-    #: Defaults to the :setting:`CELERY_TASK_TIME_LIMIT` setting.
+    #: Defaults to the :setting:`CELERYD_TASK_TIME_LIMIT` setting.
     time_limit = None
 
     #: Soft time limit.
-    #: Defaults to the :setting:`CELERY_TASK_SOFT_TIME_LIMIT` setting.
+    #: Defaults to the :setting:`CELERYD_TASK_SOFT_TIME_LIMIT` setting.
     soft_time_limit = None
 
     #: The result store backend used for this task.
@@ -344,8 +365,8 @@ class Task(object):
         """The body of the task executed by workers."""
         raise NotImplementedError('Tasks must define the run method.')
 
-    def start_strategy(self, app, consumer):
-        return instantiate(self.Strategy, self, app, consumer)
+    def start_strategy(self, app, consumer, **kwargs):
+        return instantiate(self.Strategy, self, app, consumer, **kwargs)
 
     def delay(self, *args, **kwargs):
         """Star argument version of :meth:`apply_async`.
@@ -363,7 +384,7 @@ class Task(object):
     def apply_async(self, args=None, kwargs=None,
                     task_id=None, producer=None, connection=None, router=None,
                     link=None, link_error=None, publisher=None,
-                    add_to_parent=True, **options):
+                    add_to_parent=True, reply_to=None, **options):
         """Apply tasks asynchronously by sending a message.
 
         :keyword args: The positional arguments to pass on to the
@@ -461,19 +482,21 @@ class Task(object):
             args = (self.__self__, ) + tuple(args)
 
         if conf.CELERY_ALWAYS_EAGER:
-            return self.apply(args, kwargs, task_id=task_id, **options)
+            return self.apply(args, kwargs, task_id=task_id,
+                              link=link, link_error=link_error, **options)
         options = dict(extract_exec_options(self), **options)
         options = router.route(options, self.name, args, kwargs)
 
         if connection:
             producer = app.amqp.TaskProducer(connection)
         with app.producer_or_acquire(producer) as P:
-            extra_properties = self.backend.on_task_call(P, task_id)
+            self.backend.on_task_call(P, task_id)
             task_id = P.publish_task(self.name, args, kwargs,
                                      task_id=task_id,
                                      callbacks=maybe_list(link),
                                      errbacks=maybe_list(link_error),
-                                     **dict(options, **extra_properties))
+                                     reply_to=reply_to or self.app.oid,
+                                     **options)
         result = self.AsyncResult(task_id)
         if add_to_parent:
             parent = get_current_worker_task()
@@ -585,7 +608,8 @@ class Task(object):
             raise ret
         return ret
 
-    def apply(self, args=None, kwargs=None, **options):
+    def apply(self, args=None, kwargs=None,
+              link=None, link_error=None, **options):
         """Execute this task locally, by blocking until the task returns.
 
         :param args: positional arguments passed on to the task.
@@ -619,6 +643,8 @@ class Task(object):
                    'is_eager': True,
                    'logfile': options.get('logfile'),
                    'loglevel': options.get('loglevel', 0),
+                   'callbacks': maybe_list(link),
+                   'errbacks': maybe_list(link_error),
                    'delivery_info': {'is_eager': True}}
         if self.accept_magic_kwargs:
             default_kwargs = {'task_name': task.name,
@@ -720,7 +746,7 @@ class Task(object):
         :param args: Original arguments for the retried task.
         :param kwargs: Original keyword arguments for the retried task.
 
-        :keyword einfo: :class:`~celery.datastructures.ExceptionInfo`
+        :keyword einfo: :class:`~billiard.einfo.ExceptionInfo`
                         instance, containing the traceback.
 
         The return value of this handler is ignored.
@@ -739,7 +765,7 @@ class Task(object):
         :param kwargs: Original keyword arguments for the task
                        that failed.
 
-        :keyword einfo: :class:`~celery.datastructures.ExceptionInfo`
+        :keyword einfo: :class:`~billiard.einfo.ExceptionInfo`
                         instance, containing the traceback.
 
         The return value of this handler is ignored.
@@ -757,7 +783,7 @@ class Task(object):
         :param kwargs: Original keyword arguments for the task
                        that failed.
 
-        :keyword einfo: :class:`~celery.datastructures.ExceptionInfo`
+        :keyword einfo: :class:`~billiard.einfo.ExceptionInfo`
                         instance, containing the traceback (if any).
 
         The return value of this handler is ignored.
@@ -778,9 +804,7 @@ class Task(object):
 
     def __repr__(self):
         """`repr(task)`"""
-        if self.__self__:
-            return '<bound task {0.name} of {0.__self__}>'.format(self)
-        return '<@task: {0.name}>'.format(self)
+        return _reprtask(self, R_SELF_TASK if self.__self__ else R_INSTANCE)
 
     def _get_request(self):
         """Get current request object."""

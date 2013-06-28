@@ -6,6 +6,8 @@ from functools import wraps
 from mock import patch
 from pickle import loads, dumps
 
+from kombu import Queue
+
 from celery.task import (
     current,
     task,
@@ -25,7 +27,7 @@ from celery.schedules import crontab, crontab_parser, ParseException
 from celery.utils import uuid
 from celery.utils.timeutils import parse_iso8601, timedelta_seconds
 
-from celery.tests.utils import Case, with_eager_tasks, WhateverIO
+from celery.tests.case import Case, with_eager_tasks, WhateverIO
 
 
 def now():
@@ -232,7 +234,6 @@ class test_tasks(Case):
         @task
         def xxx():
             pass
-
         self.assertIs(pickle.loads(pickle.dumps(xxx)), xxx.app.tasks[xxx.name])
 
     def createTask(self, name):
@@ -290,6 +291,7 @@ class test_tasks(Case):
             consumer.receive('foo', 'foo')
         consumer.purge()
         self.assertIsNone(consumer.queues[0].get())
+        T1.get_consumer(queues=[Queue('foo')])
 
         # Without arguments.
         presult = T1.delay()
@@ -338,6 +340,21 @@ class test_tasks(Case):
 
         publisher = T1.get_publisher()
         self.assertTrue(publisher.exchange)
+
+    def test_repr_v2_compat(self):
+        task = type(self.createTask('c.unittest.v2c'))
+        task.__v2_compat__ = True
+        self.assertIn('v2 compatible', repr(task))
+
+    def test_apply_with_self(self):
+
+        @task(__self__=42)
+        def tawself(self):
+            return self
+
+        self.assertEqual(tawself.apply().get(), 42)
+
+        self.assertEqual(tawself(), 42)
 
     def test_context_get(self):
         task = self.createTask('c.unittest.t.c.g')

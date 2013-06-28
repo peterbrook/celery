@@ -195,7 +195,7 @@ def remaining(start, ends_in, now=None, relative=False):
     if relative:
         end_date = delta_resolution(end_date, ends_in)
     ret = end_date - now
-    if C_REMDEBUG:
+    if C_REMDEBUG:  # pragma: no cover
         print('rem: NOW:%r START:%r ENDS_IN:%r END_DATE:%s REM:%s' % (
             now, start, ends_in, end_date, ret))
     return ret
@@ -229,7 +229,7 @@ def weekday(name):
         raise KeyError(name)
 
 
-def humanize_seconds(secs, prefix='', sep=''):
+def humanize_seconds(secs, prefix='', sep='', now='now'):
     """Show seconds in human form, e.g. 60 is "1 minute", 7200 is "2
     hours".
 
@@ -243,7 +243,7 @@ def humanize_seconds(secs, prefix='', sep=''):
             w = secs / divider
             return '{0}{1}{2} {3}'.format(prefix, sep, formatter(w),
                                           pluralize(w, unit))
-    return 'now'
+    return now
 
 
 def maybe_iso8601(dt):

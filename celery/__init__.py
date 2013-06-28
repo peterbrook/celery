@@ -2,13 +2,13 @@
 """Distributed Task Queue"""
 # :copyright: (c) 2009 - 2012 Ask Solem and individual contributors,
 #                 All rights reserved.
-# :copyright: (c) 2012 VMware, Inc., All rights reserved.
+# :copyright: (c) 2012-2013 GoPivotal, Inc., All rights reserved.
 # :license:   BSD (3 Clause), see LICENSE for more details.
 
 from __future__ import absolute_import
 
 SERIES = 'Cipater'
-VERSION = (3, 1, 0, 'rc1')
+VERSION = (3, 1, 0, 'rc3')
 __version__ = '.'.join(str(p) for p in VERSION[0:3]) + ''.join(VERSION[3:])
 __author__ = 'Ask Solem'
 __contact__ = 'ask@celeryproject.org'
@@ -25,7 +25,7 @@ VERSION_BANNER = '{0} ({1})'.format(__version__, SERIES)
 # -eof meta-
 
 import os
-if os.environ.get('C_IMPDEBUG'):
+if os.environ.get('C_IMPDEBUG'):  # pragma: no cover
     import sys
     from .five import builtins
     real_import = builtins.__import__
@@ -40,7 +40,7 @@ if os.environ.get('C_IMPDEBUG'):
 
 STATICA_HACK = True
 globals()['kcah_acitats'[::-1].upper()] = False
-if STATICA_HACK:
+if STATICA_HACK:  # pragma: no cover
     # This is never executed, but tricks static analyzers (PyDev, PyCharm,
     # pylint, etc.) into knowing the types of these symbols, and what
     # they contain.

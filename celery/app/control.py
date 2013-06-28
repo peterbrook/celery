@@ -9,15 +9,31 @@
 """
 from __future__ import absolute_import
 
+import warnings
+
 from kombu.pidbox import Mailbox
 from kombu.utils import cached_property
 
+from celery.exceptions import DuplicateNodenameWarning
+
 from . import app_or_default
+
+W_DUPNODE = """\
+Received multiple replies from node name {0!r}.
+Please make sure you give each node a unique nodename using the `-n` option.\
+"""
 
 
 def flatten_reply(reply):
     nodes = {}
+    seen = set()
     for item in reply:
+        dup = next((nodename in seen for nodename in item), None)
+        if dup:
+            warnings.warn(DuplicateNodenameWarning(
+                W_DUPNODE.format(dup),
+            ))
+        seen.update(item)
         nodes.update(item)
     return nodes
 
@@ -90,6 +106,15 @@ class Inspect(object):
 
     def hello(self):
         return self._request('hello')
+
+    def memsample(self):
+        return self._request('memsample')
+
+    def memdump(self, samples=10):
+        return self._request('memdump', samples=samples)
+
+    def objgraph(self, type='Request', n=200, max_depth=10):
+        return self._request('objgraph', num=n, max_depth=max_depth, type=type)
 
 
 class Control(object):
@@ -244,7 +269,7 @@ class Control(object):
         Supports the same arguments as :meth:`broadcast`.
 
         """
-        return self.broadcast('pool_grow', {}, destination, **kwargs)
+        return self.broadcast('pool_grow', {'n': n}, destination, **kwargs)
 
     def pool_shrink(self, n=1, destination=None, **kwargs):
         """Tell all (or specific) workers to shrink the pool by ``n``.
@@ -252,7 +277,7 @@ class Control(object):
         Supports the same arguments as :meth:`broadcast`.
 
         """
-        return self.broadcast('pool_shrink', {}, destination, **kwargs)
+        return self.broadcast('pool_shrink', {'n': n}, destination, **kwargs)
 
     def broadcast(self, command, arguments=None, destination=None,
                   connection=None, reply=False, timeout=1, limit=None,

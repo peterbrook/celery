@@ -23,7 +23,7 @@ from celery.task import trace
 from celery.utils.log import ensure_process_aware_logger
 from celery.worker import state
 
-from celery.tests.utils import (
+from celery.tests.case import (
     AppCase,
     WhateverIO,
     skip_if_pypy,
@@ -102,6 +102,26 @@ class test_Worker(WorkerAppCase):
         x.run = Mock()
         with self.assertRaises(ImportError):
             x.execute_from_commandline(['worker', '-P', 'xyzybox'])
+
+    def test_run_from_argv_basic(self):
+        x = worker(app=self.app)
+        x.run = Mock()
+        x.maybe_detach = Mock()
+
+        def run(*args, **kwargs):
+            pass
+        x.run = run
+        x.run_from_argv('celery', [])
+        self.assertTrue(x.maybe_detach.called)
+
+    def test_maybe_detach(self):
+        x = worker(app=self.app)
+        with patch('celery.bin.worker.detached_celeryd') as detached:
+            x.maybe_detach([])
+            self.assertFalse(detached.called)
+            with self.assertRaises(SystemExit):
+                x.maybe_detach(['--detach'])
+            self.assertTrue(detached.called)
 
     @disable_stdouts
     def test_invalid_loglevel_gives_error(self):
@@ -271,6 +291,7 @@ class test_Worker(WorkerAppCase):
         worker1 = self.Worker(loglevel=0xFFFF)
         self.assertEqual(worker1.loglevel, 0xFFFF)
 
+    @disable_stdouts
     def test_warns_if_running_as_privileged_user(self):
         app = current_app
         if app.IS_WINDOWS:
@@ -294,6 +315,31 @@ class test_Worker(WorkerAppCase):
         self.Worker(redirect_stdouts=False)
         with self.assertRaises(AttributeError):
             sys.stdout.logger
+
+    @disable_stdouts
+    def test_on_start_custom_logging(self):
+        prev, self.app.log.redirect_stdouts = (
+            self.app.log.redirect_stdouts, Mock(),
+        )
+        try:
+            worker = self.Worker(redirect_stoutds=True)
+            worker._custom_logging = True
+            worker.on_start()
+            self.assertFalse(self.app.log.redirect_stdouts.called)
+        finally:
+            self.app.log.redirect_stdouts = prev
+
+    def test_setup_logging_no_color(self):
+        worker = self.Worker(redirect_stdouts=False, no_color=True)
+        prev, self.app.log.setup = self.app.log.setup, Mock()
+        worker.setup_logging()
+        self.assertFalse(self.app.log.setup.call_args[1]['colorize'])
+
+    @disable_stdouts
+    def test_startup_info_pool_is_str(self):
+        worker = self.Worker(redirect_stdouts=False)
+        worker.pool_cls = 'foo'
+        worker.startup_info()
 
     def test_redirect_stdouts_already_handled(self):
         logging_setup = [False]
